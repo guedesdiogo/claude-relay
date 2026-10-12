@@ -27,7 +27,6 @@
   "files": [
     "bin/",
     "README.md",
-    "README.pt-BR.md",
     "LICENSE"
   ],
   "os": [

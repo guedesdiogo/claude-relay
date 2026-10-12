@@ -13,8 +13,6 @@ account. `claude-session-restorer` rebuilds that list for whichever account you 
 so you can pick up any session exactly where you left off. Switch back, run it again, and you are
 back where you were. Repeat as often as you like.
 
-🇧🇷 [Leia em português](README.pt-BR.md)
-
 > This is a macOS port of
 > [sahol3/claude-code-session-restorer](https://github.com/sahol3/claude-code-session-restorer)
 > (Windows / PowerShell). It is an unofficial community tool, not affiliated with or endorsed by

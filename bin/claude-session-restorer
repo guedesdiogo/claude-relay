@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""
+claude-session-restorer
+-----------------------
+Make your Claude Code sessions show up in the Claude Desktop "Code" tab of the
+account you are logged into right now -- including sessions created under a
+DIFFERENT Claude account and sessions started from the CLI or VS Code.
+
+macOS port of restore-code-tab-sessions.ps1 from
+https://github.com/sahol3/claude-code-session-restorer (MIT).
+
+How it works
+  The Code tab does not list transcripts directly. It lists small "card" files
+  stored per account:
+    ~/Library/Application Support/Claude/claude-code-sessions/<accountId>/<orgId>/local_*.json
+  Each card points at a transcript through its "cliSessionId" field.
+  Transcripts live in ~/.claude/projects/<folder>/<sessionId>.jsonl and are not
+  tied to any account.
+
+What it does (idempotent and reversible)
+  1. Backs up the whole card folder.
+  2. Copies cards that live under other accounts into the current account.
+  3. (default) Creates cards for transcripts that have no card anywhere.
+
+Unofficial tool. The file format was worked out by observation and may change
+in future versions of the Claude Desktop app. Use at your own risk.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+HOME = Path.home()
+DEFAULT_PROJECTS = HOME / ".claude" / "projects"
+DEFAULT_CARDS = HOME / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+CLAUDE_JSON = HOME / ".claude.json"
+APP_NAME = "Claude"
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+COLORS = {"gray": "90", "white": "97", "cyan": "36", "green": "32", "yellow": "33", "red": "31"}
+
+
+def say(msg, color="gray"):
+    if USE_COLOR:
+        print(f"\033[{COLORS[color]}m{msg}\033[0m")
+    else:
+        print(msg)
+
+
+def load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def iter_cards(root):
+    if not root.exists():
+        return []
+    return [p for p in root.rglob("local_*.json") if p.is_file()]
+
+
+# ---------------------------------------------------------------------------
+# Claude Desktop process helpers
+# ---------------------------------------------------------------------------
+def claude_running():
+    try:
+        r = subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True, text=True)
+        return [pid for pid in r.stdout.split() if pid]
+    except Exception:
+        return []
+
+
+def quit_claude(timeout=30):
+    if not claude_running():
+        return True
+    say("Quitting Claude Desktop...", "cyan")
+    try:
+        subprocess.run(["osascript", "-e", f'quit app "{APP_NAME}"'],
+                       capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not claude_running():
+            time.sleep(1)  # let the app finish writing its files
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def open_claude():
+    try:
+        subprocess.run(["open", "-a", APP_NAME], capture_output=True, text=True, timeout=15)
+        say("Claude Desktop reopened.", "cyan")
+    except Exception:
+        say("Could not reopen Claude Desktop; open it manually.", "yellow")
+
+
+# ---------------------------------------------------------------------------
+# Transcript parsing
+# ---------------------------------------------------------------------------
+def to_epoch_ms(iso, fallback_ts):
+    if iso:
+        try:
+            s = str(iso).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            # normalise fractional seconds to 6 digits (Python < 3.11 compatibility)
+            m = re.match(r"^(.*?\.)(\d+)(.*)$", s)
+            if m:
+                s = m.group(1) + (m.group(2) + "000000")[:6] + m.group(3)
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            pass
+    return int(fallback_ts * 1000)
+
+
+SKIP_USER = [
+    re.compile(r"^\s*<"),
+    re.compile(r"^This session is being continued"),
+    re.compile(r"^\s*Caveat:"),
+    re.compile(r"^Base directory for this skill"),
+]
+
+
+def get_meta(path):
+    """Read cwd, creation timestamp and a title from the first 400 lines of a transcript."""
+    cwd = created = ai = summ = usr = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f, 1):
+                if i > 400:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(o, dict):
+                    continue
+                if not created and o.get("timestamp"):
+                    created = o["timestamp"]
+                if not cwd and o.get("cwd"):
+                    cwd = o["cwd"]
+                if not ai and o.get("type") == "ai-title" and o.get("aiTitle"):
+                    ai = o["aiTitle"]
+                if not summ and o.get("type") == "summary" and o.get("summary"):
+                    summ = o["summary"]
+                if not usr and o.get("type") == "user" and isinstance(o.get("message"), dict):
+                    c = o["message"].get("content")
+                    txt = None
+                    if isinstance(c, str):
+                        txt = c
+                    elif isinstance(c, list):
+                        for part in c:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                txt = part.get("text")
+                                break
+                    if txt and not any(rx.search(txt) for rx in SKIP_USER):
+                        usr = txt
+                if cwd and created and ai:
+                    break
+    except Exception:
+        pass
+    title = ai or (re.sub(r"\s+", " ", summ) if summ else None) or (re.sub(r"\s+", " ", usr) if usr else None)
+    if title and len(title) > 80:
+        title = title[:80]
+    return cwd, created, title
+
+
+# ---------------------------------------------------------------------------
+# Account detection
+# ---------------------------------------------------------------------------
+def read_current_account():
+    if not CLAUDE_JSON.exists():
+        return None
+    cj = load_json(CLAUDE_JSON)
+    if isinstance(cj, dict):
+        oa = cj.get("oauthAccount") or {}
+        a, o = oa.get("accountUuid"), oa.get("organizationUuid")
+        if a and o:
+            return a, o
+    # fallback identical to the original script: regex over the raw text
+    try:
+        raw = CLAUDE_JSON.read_text(encoding="utf-8", errors="replace")
+        m = re.search(
+            r'"oauthAccount"\s*:\s*\{[\s\S]*?"accountUuid"\s*:\s*"([0-9a-fA-F\-]+)"'
+            r'[\s\S]*?"organizationUuid"\s*:\s*"([0-9a-fA-F\-]+)"',
+            raw,
+        )
+        if m:
+            return m.group(1), m.group(2)
+    except Exception:
+        pass
+    return None
+
+
+def same_dir(a, b):
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except Exception:
+        return str(a) == str(b)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+def cmd_list(cards_root):
+    say(f"Card folder: {cards_root}", "cyan")
+    if not cards_root.exists():
+        say("The folder does not exist. Open the Code tab in Claude Desktop at least once, "
+            "or point to the right folder with --cards-dir.", "yellow")
+        return 1
+    current = read_current_account()
+    found = False
+    for acct_dir in sorted(p for p in cards_root.iterdir() if p.is_dir()):
+        for org_dir in sorted(p for p in acct_dir.iterdir() if p.is_dir()):
+            found = True
+            n = len(list(org_dir.glob("local_*.json")))
+            mark = "  <- logged in" if current and (acct_dir.name, org_dir.name) == current else ""
+            say(f"  {acct_dir.name}/{org_dir.name}: {n} card(s){mark}", "white")
+    if not found:
+        say("  (no account folders yet)", "gray")
+    if current:
+        say(f"Logged-in account (from {CLAUDE_JSON}): {current[0]} / {current[1]}", "cyan")
+    else:
+        say(f"Could not read the logged-in account from {CLAUDE_JSON}.", "yellow")
+    return 0
+
+
+def make_backup(cards_root):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bk = Path(f"{cards_root}_backup_{stamp}")
+    n = 2
+    while bk.exists():
+        bk = Path(f"{cards_root}_backup_{stamp}_{n}")
+        n += 1
+    shutil.copytree(cards_root, bk)
+    return bk
+
+
+def cmd_restore(args, cards_root, projects_root):
+    # 1) Claude must be closed: it rewrites the card folder when it exits.
+    if args.quit:
+        if not quit_claude():
+            say("Claude Desktop did not quit in time. Quit it with Cmd+Q and run again.", "yellow")
+            return 1
+    elif not args.ignore_running and not args.dest_root:
+        pids = claude_running()
+        if pids:
+            say(f"Claude Desktop is still running (PID {', '.join(pids)}).", "yellow")
+            say("Quit it completely with Cmd+Q and run again, or pass --quit to do it for you.", "yellow")
+            return 1
+
+    # 2) Destination = <accountId>/<orgId> of the logged-in account.
+    if args.dest_root:
+        dest = Path(args.dest_root).expanduser()
+    else:
+        if args.account and args.org:
+            acct, org = args.account, args.org
+        elif args.account or args.org:
+            say("--account and --org must be used together.", "yellow")
+            return 2
+        else:
+            cur = read_current_account()
+            if not cur:
+                say(f"Could not read the logged-in account from {CLAUDE_JSON}.", "yellow")
+                say("Sign in to Claude Desktop and open the Code tab once, or pass --account/--org.", "yellow")
+                return 1
+            acct, org = cur
+        dest = cards_root / acct / org
+        say(f"Logged-in account : {acct}", "cyan")
+        say(f"Organization      : {org}", "cyan")
+    say(f"Target folder     : {dest}", "cyan")
+
+    if not cards_root.exists() and not args.dest_root:
+        say(f"Warning: {cards_root} does not exist yet. If Claude Desktop stores cards elsewhere "
+            "on your Mac, run with --list or --cards-dir.", "yellow")
+
+    if args.dry_run:
+        say("Dry run: nothing will be written.", "yellow")
+    else:
+        dest.mkdir(parents=True, exist_ok=True)
+
+    # 3) Back up the whole card folder.
+    if not args.no_backup and not args.dry_run and cards_root.exists():
+        bk = make_backup(cards_root)
+        say(f"Backup            : {bk}", "green")
+
+    # 4) Template card for model / effort / MCP defaults (smallest existing card).
+    all_cards = iter_cards(cards_root)
+    tmpl = load_json(min(all_cards, key=lambda p: p.stat().st_size)) if all_cards else None
+    tmpl = tmpl if isinstance(tmpl, dict) else {}
+    def_model = tmpl.get("model") or "claude-opus-4-8"
+    def_effort = tmpl.get("effort") or "high"
+    def_chrome = tmpl.get("chromePermissionMode") or "default"
+    def_mcp = tmpl.get("remoteMcpServersConfig") if tmpl else None
+
+    # 5) cliSessionIds that already have a card in the destination.
+    have = set()
+    if dest.exists():
+        for f in dest.glob("local_*.json"):
+            o = load_json(f)
+            if isinstance(o, dict) and o.get("cliSessionId"):
+                have.add(str(o["cliSessionId"]).lower())
+
+    # 6) Copy cards from other accounts.
+    copied = 0
+    for f in all_cards:
+        if same_dir(f.parent, dest):
+            continue
+        o = load_json(f)
+        if not isinstance(o, dict) or not o.get("cliSessionId"):
+            continue
+        key = str(o["cliSessionId"]).lower()
+        if key in have:
+            continue
+        if not args.dry_run:
+            target = dest / f.name
+            if target.exists():
+                target = dest / f"local_{uuid.uuid4()}.json"
+            shutil.copy2(f, target)
+        have.add(key)
+        copied += 1
+    say(f"{'Would copy' if args.dry_run else 'Copied'} {copied} card(s) from other accounts.", "green")
+
+    # 7) Create cards for transcripts that have none (unless --existing-cards-only).
+    if args.existing_cards_only:
+        say("--existing-cards-only: CLI / VS Code sessions skipped.", "yellow")
+    elif not projects_root.exists():
+        say(f"Warning: {projects_root} does not exist; no transcripts to scan.", "yellow")
+    else:
+        generated = skipped = 0
+        for t in projects_root.rglob("*.jsonl"):
+            if not t.is_file() or t.parent.name == "subagents":
+                continue
+            cli = t.stem
+            key = cli.lower()
+            if key in have:
+                skipped += 1
+                continue
+            cwd, created_iso, title = get_meta(t)
+            cwd = cwd or ""
+            st = t.stat()
+            birth = getattr(st, "st_birthtime", st.st_mtime)
+            created = to_epoch_ms(created_iso, birth)
+            last = int(st.st_mtime * 1000)
+            if not title:
+                leaf = os.path.basename(cwd.rstrip("/")) if cwd else "session"
+                title = f"{leaf} (recovered)"
+            g = str(uuid.uuid4())
+            rec = {
+                "sessionId": f"local_{g}", "cliSessionId": cli, "cwd": cwd, "originCwd": cwd,
+                "lastFocusedAt": last, "createdAt": created, "lastActivityAt": last,
+                "model": def_model, "effort": def_effort, "isArchived": False,
+                "title": title, "titleSource": "auto", "permissionMode": "auto",
+                "remoteMcpServersConfig": def_mcp, "chromePermissionMode": def_chrome,
+                "completedTurns": 1, "alwaysAllowedReasons": None,
+                "sessionPermissionUpdates": None, "classifierSummaryEnabled": True,
+            }
+            if not args.dry_run:
+                with open(dest / f"local_{g}.json", "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh, ensure_ascii=False, separators=(",", ":"))
+            have.add(key)
+            generated += 1
+        verb = "Would create" if args.dry_run else "Created"
+        say(f"{verb} {generated} new card(s); {skipped} already present.", "green")
+
+    if args.dry_run:
+        say("Dry run finished.", "white")
+    else:
+        total = len(list(dest.glob("local_*.json")))
+        say(f"Done. This account's Code tab now has {total} session card(s).", "white")
+        if args.reopen:
+            open_claude()
+        else:
+            say("Open Claude Desktop -> Code tab: your sessions should be listed.", "cyan")
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="claude-session-restorer",
+        description="Restore Claude Code sessions in the Claude Desktop Code tab after switching accounts (macOS).",
+        epilog="Quit Claude Desktop (Cmd+Q) before running, or use --quit --reopen.",
+    )
+    ap.add_argument("--list", action="store_true",
+                    help="show account folders and how many cards each has; changes nothing")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show what would be copied/created without writing anything")
+    ap.add_argument("--existing-cards-only", action="store_true",
+                    help="only migrate sessions created in the Desktop Code tab (skip CLI / VS Code sessions)")
+    ap.add_argument("--quit", action="store_true",
+                    help="quit Claude Desktop before restoring")
+    ap.add_argument("--reopen", action="store_true",
+                    help="reopen Claude Desktop after restoring")
+    ap.add_argument("--account", metavar="UUID", help="target account id (use with --org)")
+    ap.add_argument("--org", metavar="UUID", help="target organization id (use with --account)")
+    ap.add_argument("--cards-dir", metavar="PATH",
+                    help=f"Claude Desktop card folder (default: {DEFAULT_CARDS})")
+    ap.add_argument("--projects-dir", metavar="PATH",
+                    help=f"Claude Code transcripts folder (default: {DEFAULT_PROJECTS})")
+    ap.add_argument("--dest-root", metavar="PATH",
+                    help="write cards to this folder instead of the live one (testing)")
+    ap.add_argument("--ignore-running", action="store_true",
+                    help="do not abort if Claude Desktop appears to be running")
+    ap.add_argument("--no-backup", action="store_true", help="skip the backup (testing only)")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    cards_root = Path(args.cards_dir).expanduser() if args.cards_dir else DEFAULT_CARDS
+    projects_root = Path(args.projects_dir).expanduser() if args.projects_dir else DEFAULT_PROJECTS
+
+    say(f"== claude-session-restorer {__version__} ==", "white")
+    if sys.platform != "darwin":
+        say("Note: this tool targets macOS. On Windows use the original PowerShell script: "
+            "https://github.com/sahol3/claude-code-session-restorer", "yellow")
+
+    if args.list:
+        return cmd_list(cards_root)
+    return cmd_restore(args, cards_root, projects_root)
+
+
+if __name__ == "__main__":
+    if sys.version_info < (3, 8):
+        sys.stderr.write("claude-session-restorer needs Python 3.8 or newer.\n")
+        sys.exit(1)
+    sys.exit(main())

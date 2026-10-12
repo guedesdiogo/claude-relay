@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        # 3.9 is the version shipped with Apple's Command Line Tools
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Smoke test the CLI
+        run: |
+          python bin/claude-session-restorer --version
+          python bin/claude-session-restorer --help
+
+  versions:
+    name: Version numbers agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare package.json and the CLI
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          CLI=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' bin/claude-session-restorer)
+          echo "package.json=$PKG cli=$CLI"
+          test "$PKG" = "$CLI"
+
+  npm-package:
+    name: npm package builds
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Pack and run from the tarball
+        run: |
+          npm pack
+          npm install -g ./guedesdiogo-claude-session-restorer-*.tgz
+          claude-session-restorer --version

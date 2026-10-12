@@ -1,0 +1,45 @@
+{
+  "name": "@guedesdiogo/claude-session-restorer",
+  "version": "1.0.0",
+  "description": "Restore Claude Code sessions in the Claude Desktop Code tab after switching Claude accounts (macOS).",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "claude-desktop",
+    "anthropic",
+    "sessions",
+    "macos",
+    "cli"
+  ],
+  "homepage": "https://github.com/guedesdiogo/claude-session-restorer#readme",
+  "bugs": {
+    "url": "https://github.com/guedesdiogo/claude-session-restorer/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guedesdiogo/claude-session-restorer.git"
+  },
+  "license": "MIT",
+  "author": "Diogo Guedes (https://github.com/guedesdiogo)",
+  "bin": {
+    "claude-session-restorer": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "README.pt-BR.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -v"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  }
+}

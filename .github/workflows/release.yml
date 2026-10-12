@@ -1,0 +1,92 @@
+name: Release
+
+# Push a tag like v1.2.3 (matching package.json and __version__) to:
+#   1. run the tests on macOS
+#   2. create the GitHub Release
+#   3. publish the npm package to GitHub Packages
+#   4. update the Homebrew formula in guedesdiogo/homebrew-tap
+#      (only if the HOMEBREW_TAP_TOKEN secret is set)
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: python -m unittest discover -s tests -v
+      - name: Tag matches the version in the code
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          CLI=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' bin/claude-session-restorer)
+          echo "tag=$TAG package.json=$PKG cli=$CLI"
+          test "$TAG" = "$PKG" && test "$TAG" = "$CLI"
+
+  github-release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+
+  npm-github-packages:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://npm.pkg.github.com
+          scope: "@guedesdiogo"
+      - name: Publish to GitHub Packages
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew-tap:
+    needs: github-release
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip when no tap token is configured
+        if: env.TAP_TOKEN == ''
+        run: echo "::notice::HOMEBREW_TAP_TOKEN not set; update the formula in guedesdiogo/homebrew-tap by hand."
+      - name: Render formula
+        if: env.TAP_TOKEN != ''
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          SHA=$(curl -fsSL "$URL" | sha256sum | cut -d' ' -f1)
+          sed -e "s/__VERSION__/${VERSION}/g" -e "s/__SHA256__/${SHA}/g" \
+            packaging/homebrew/claude-session-restorer.rb.tmpl > /tmp/claude-session-restorer.rb
+          cat /tmp/claude-session-restorer.rb
+      - name: Push to the tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/guedesdiogo/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp /tmp/claude-session-restorer.rb tap/Formula/claude-session-restorer.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/claude-session-restorer.rb
+          git diff --cached --quiet && { echo "Formula already up to date"; exit 0; }
+          git commit -m "claude-session-restorer ${GITHUB_REF_NAME}"
+          git push

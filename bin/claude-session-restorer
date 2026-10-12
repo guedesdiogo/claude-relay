@@ -37,7 +37,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 HOME = Path.home()
 DEFAULT_PROJECTS = HOME / ".claude" / "projects"
@@ -260,7 +260,8 @@ def cmd_restore(args, cards_root, projects_root):
         if not quit_claude():
             say("Claude Desktop did not quit in time. Quit it with Cmd+Q and run again.", "yellow")
             return 1
-    elif not args.ignore_running and not args.dest_root:
+    elif not args.ignore_running and not args.dest_root and not args.dry_run:
+        # A dry run writes nothing, so it is safe while Claude Desktop is open.
         pids = claude_running()
         if pids:
             say(f"Claude Desktop is still running (PID {', '.join(pids)}).", "yellow")

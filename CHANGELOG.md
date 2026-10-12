@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1 — 2026-10-12
+
+- `--dry-run` no longer requires Claude Desktop to be closed, since it writes nothing.
+
 ## 1.0.0 — 2026-10-12
 
 First release. macOS port of

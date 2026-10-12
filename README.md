@@ -151,7 +151,7 @@ alias claude-switch='claude-session-restorer --quit --reopen'
 | `--quit` | Quit Claude Desktop before restoring (waits until it has fully exited). |
 | `--reopen` | Open Claude Desktop again when finished. |
 | `--existing-cards-only` | Only move sessions that were created in the Desktop Code tab. Skips sessions started from the `claude` CLI or VS Code, to keep the list short. |
-| `--account UUID --org UUID` | Restore into this account instead of the one detected from `~/.claude.json`. |
+| `--account UUID --org UUID` | Restore into this account instead of the detected one. |
 | `--cards-dir PATH` | Use a different Claude Desktop card folder. |
 | `--projects-dir PATH` | Use a different Claude Code transcripts folder. |
 | `--dest-root PATH` | Write cards to a scratch folder instead of the live one (testing). |
@@ -185,8 +185,10 @@ another account, and sessions started from the CLI or VS Code, do not show up.
 
 On each run, the tool:
 
-1. Reads the logged-in account from `~/.claude.json` (`oauthAccount.accountUuid` and
-   `oauthAccount.organizationUuid`).
+1. Finds the account Claude Desktop is signed into, from `lastKnownAccountUuid` in the app's
+   `config.json` (or `claude_desktop_config.json`), and the organization from that account's card
+   folder. Claude Desktop does **not** update `~/.claude.json` when you switch accounts in the app,
+   so that file (the `claude` CLI login) is only used as a fallback.
 2. Backs up the whole `claude-code-sessions` folder.
 3. Copies any card from another account folder whose transcript is not already listed for the
    current account.
@@ -232,12 +234,13 @@ cp -R ~/.claude/projects ~/claude-projects-backup-$(date +%Y%m%d)
 **"Claude Desktop is still running"** — The app rewrites the card folder when it exits, so it has
 to be closed first. Use `--quit`, or quit with **Cmd+Q** (closing the window only hides it).
 
-**"Could not read the logged-in account"** — Sign in to Claude Desktop and open the Code tab once,
-so `~/.claude.json` records the account. Then run again. You can also pass `--account` and
-`--org`; get the IDs from `claude-session-restorer --list`.
+**"… has no session folder yet. Open the Code tab …"** — Claude Desktop creates the folder for an
+account the first time you open the Code tab with it. Open it once, then run again.
 
-**The detected account is the old one** — Open Claude Desktop, go to the Code tab with the new
-account, quit with Cmd+Q, and run again. Confirm with `--list`.
+**The detected account is wrong** — `--list` shows where the account was read from. Pass the right
+one explicitly with `--account` and `--org`, using the folder names `--list` prints, and please
+[open an issue](https://github.com/guedesdiogo/claude-session-restorer/issues) with your Claude
+Desktop version.
 
 **"… does not exist" for the card folder** — Claude Desktop may store cards somewhere else on your
 version. Look with `ls ~/Library/Application\ Support/Claude/` and pass the right folder with

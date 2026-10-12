@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 — 2026-10-12
+
+- Detect the account Claude Desktop is signed into from its own config (`lastKnownAccountUuid`).
+  Claude Desktop does not update `~/.claude.json` when you switch accounts in the app, so 1.0.x
+  restored into the previous account. `~/.claude.json` is now only a fallback.
+- Clear message when the new account has no session folder yet (open the Code tab once).
+- `--list` and the restore output say where the account was detected from.
+
 ## 1.0.1 — 2026-10-12
 
 - `--dry-run` no longer requires Claude Desktop to be closed, since it writes nothing.

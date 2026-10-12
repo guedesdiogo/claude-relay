@@ -25,6 +25,12 @@ class FakeHome:
             {"numStartups": 3, "oauthAccount": {"accountUuid": account, "organizationUuid": org,
                                                 "emailAddress": "x@example.com"}}))
 
+    def desktop_login(self, account, filename="config.json", nested=False):
+        data = {"lastKnownAccountUuid": account}
+        if nested:
+            data = {"accounts": {"state": data}}
+        (self.cards.parent / filename).write_text(json.dumps(data))
+
     def add_card(self, account, org, cli_id, title="desk"):
         d = self.cards / account / org
         d.mkdir(parents=True, exist_ok=True)
@@ -121,6 +127,32 @@ class RestorerTests(unittest.TestCase):
         r = self.h.run()
         self.assertEqual(r.returncode, 1)
         self.assertIn("Could not read the logged-in account", r.stdout)
+
+    def test_desktop_account_wins_over_cli_login(self):
+        # Claude Desktop switched to B; ~/.claude.json still says A (what happened on a real Mac).
+        self.h.login("acctA", "orgA")
+        self.h.desktop_login("acctB")
+        (self.h.cards / "acctB" / "orgB").mkdir(parents=True)
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Detected from     : ", r.stdout)
+        self.assertEqual([c["cliSessionId"] for c in self.h.cards_of("acctB", "orgB")], ["S1"])
+        self.assertIn("acctB/orgB: 1 card(s)  <- logged in", self.h.run("--list").stdout)
+
+    def test_desktop_account_nested_key_and_other_file(self):
+        self.h.desktop_login("acctB", filename="claude_desktop_config.json", nested=True)
+        (self.h.cards / "acctB" / "orgB").mkdir(parents=True)
+        r = self.h.run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.h.cards_of("acctB", "orgB")), 2)
+
+    def test_desktop_account_without_folder_asks_to_open_code_tab(self):
+        self.h.login("acctA", "orgA")
+        self.h.desktop_login("acctB")
+        r = self.h.run()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Open the Code tab", r.stdout)
+        self.assertEqual(self.h.cards_of("acctA", "orgA")[0]["cliSessionId"], "S1")  # untouched
 
     def test_explicit_account(self):
         r = self.h.run("--account", "acctZ", "--org", "orgZ")

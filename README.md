@@ -280,13 +280,11 @@ The tests run the real CLI against a temporary fake home folder; they never touc
 Claude data.
 
 **Releasing:** bump the version in `package.json` and in `__version__` inside
-`bin/claude-session-restorer`, update `CHANGELOG.md`, then:
+`bin/claude-session-restorer`, add a `## 1.2.3` section to `CHANGELOG.md`, and push to `main`.
 
-```bash
-git tag v1.2.3 && git push origin v1.2.3
-```
-
-The [release workflow](.github/workflows/release.yml) runs the tests, creates the GitHub Release,
+When the version on `main` has no matching tag yet, the
+[release workflow](.github/workflows/release.yml) runs the tests, creates the tag and the GitHub
+Release (notes taken from `CHANGELOG.md`),
 publishes the npm package to GitHub Packages and, if the `HOMEBREW_TAP_TOKEN` secret is set,
 updates the formula in [guedesdiogo/homebrew-tap](https://github.com/guedesdiogo/homebrew-tap).
 That secret is a fine-grained token with **Contents: read and write** on the tap repository.

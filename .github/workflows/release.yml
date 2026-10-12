@@ -1,21 +1,59 @@
 name: Release
 
-# Push a tag like v1.2.3 (matching package.json and __version__) to:
-#   1. run the tests on macOS
-#   2. create the GitHub Release
-#   3. publish the npm package to GitHub Packages
-#   4. update the Homebrew formula in guedesdiogo/homebrew-tap
-#      (only if the HOMEBREW_TAP_TOKEN secret is set)
+# Releases happen automatically when the version in package.json changes on main:
+#   1. bump "version" in package.json and __version__ in bin/claude-session-restorer
+#   2. update CHANGELOG.md
+#   3. push to main
+# This workflow then, only if tag v<version> does not exist yet:
+#   - runs the tests on macOS
+#   - creates the tag and the GitHub Release
+#   - publishes the npm package to GitHub Packages
+#   - updates the Homebrew formula in guedesdiogo/homebrew-tap
+#     (only when the HOMEBREW_TAP_TOKEN secret is set)
+# It can also be started by hand from the Actions tab (workflow_dispatch).
 on:
   push:
-    tags: ["v*.*.*"]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
   packages: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        name: Is this version already released?
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          CLI=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' bin/claude-session-restorer)
+          if [ "$PKG" != "$CLI" ]; then
+            echo "::error::package.json ($PKG) and __version__ ($CLI) differ"; exit 1
+          fi
+          echo "version=$PKG" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$PKG" >/dev/null; then
+            echo "v$PKG already released; nothing to do."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Releasing v$PKG"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
+    needs: check
+    if: needs.check.outputs.release == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,28 +61,32 @@ jobs:
         with:
           python-version: "3.9"
       - run: python -m unittest discover -s tests -v
-      - name: Tag matches the version in the code
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          PKG=$(node -p "require('./package.json').version")
-          CLI=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' bin/claude-session-restorer)
-          echo "tag=$TAG package.json=$PKG cli=$CLI"
-          test "$TAG" = "$PKG" && test "$TAG" = "$CLI"
 
   github-release:
-    needs: test
+    needs: [check, test]
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Create release
+      - name: Release notes from CHANGELOG.md
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## " v "( |$)" {on=1; next}
+            on && /^## / {exit}
+            on {print}
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Release v$VERSION" > notes.md
+          cat notes.md
+      - name: Create tag and release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
-            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release create "v$VERSION" --target "$GITHUB_SHA" \
+            --title "v$VERSION" --notes-file notes.md
 
   npm-github-packages:
-    needs: test
+    needs: [check, github-release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,35 +100,40 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  homebrew-tap:
-    needs: github-release
+  homebrew-formula:
+    needs: [check, github-release]
     runs-on: ubuntu-latest
     env:
+      VERSION: ${{ needs.check.outputs.version }}
       TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      - name: Skip when no tap token is configured
-        if: env.TAP_TOKEN == ''
-        run: echo "::notice::HOMEBREW_TAP_TOKEN not set; update the formula in guedesdiogo/homebrew-tap by hand."
       - name: Render formula
-        if: env.TAP_TOKEN != ''
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/v${VERSION}.tar.gz"
           SHA=$(curl -fsSL "$URL" | sha256sum | cut -d' ' -f1)
           sed -e "s/__VERSION__/${VERSION}/g" -e "s/__SHA256__/${SHA}/g" \
-            packaging/homebrew/claude-session-restorer.rb.tmpl > /tmp/claude-session-restorer.rb
-          cat /tmp/claude-session-restorer.rb
+            packaging/homebrew/claude-session-restorer.rb.tmpl > claude-session-restorer.rb
+          echo "sha256: $SHA"
+          cat claude-session-restorer.rb
+      - name: Keep the formula as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: claude-session-restorer.rb
       - name: Push to the tap
         if: env.TAP_TOKEN != ''
         run: |
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/guedesdiogo/homebrew-tap.git" tap
           mkdir -p tap/Formula
-          cp /tmp/claude-session-restorer.rb tap/Formula/claude-session-restorer.rb
+          cp claude-session-restorer.rb tap/Formula/claude-session-restorer.rb
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/claude-session-restorer.rb
           git diff --cached --quiet && { echo "Formula already up to date"; exit 0; }
-          git commit -m "claude-session-restorer ${GITHUB_REF_NAME}"
+          git commit -m "claude-session-restorer ${VERSION}"
           git push
+      - name: Note when the tap was not updated
+        if: env.TAP_TOKEN == ''
+        run: echo "::notice::HOMEBREW_TAP_TOKEN not set; copy the formula artifact into guedesdiogo/homebrew-tap by hand."

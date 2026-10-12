@@ -1,36 +1,41 @@
 {
-  "name": "@guedesdiogo/claude-session-restorer",
-  "version": "1.1.0",
-  "description": "Restore Claude Code sessions in the Claude Desktop Code tab after switching Claude accounts (macOS).",
+  "name": "@guedesdiogo/claude-relay",
+  "version": "2.0.0",
+  "description": "Use several Claude subscriptions as one: automatic account failover for Claude Code in the terminal, and session migration for Claude Desktop.",
   "keywords": [
     "claude",
     "claude-code",
     "claude-desktop",
     "anthropic",
+    "accounts",
+    "failover",
     "sessions",
-    "macos",
     "cli"
   ],
-  "homepage": "https://github.com/guedesdiogo/claude-session-restorer#readme",
+  "homepage": "https://github.com/guedesdiogo/claude-relay#readme",
   "bugs": {
-    "url": "https://github.com/guedesdiogo/claude-session-restorer/issues"
+    "url": "https://github.com/guedesdiogo/claude-relay/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/guedesdiogo/claude-session-restorer.git"
+    "url": "git+https://github.com/guedesdiogo/claude-relay.git"
   },
   "license": "MIT",
   "author": "Diogo Guedes (https://github.com/guedesdiogo)",
   "bin": {
+    "claude-relay": "bin/cli.js",
     "claude-session-restorer": "bin/cli.js"
   },
   "files": [
-    "bin/",
+    "bin/claude-relay",
+    "bin/claude-session-restorer",
+    "bin/cli.js",
     "README.md",
     "LICENSE"
   ],
   "os": [
-    "darwin"
+    "darwin",
+    "linux"
   ],
   "engines": {
     "node": ">=16"

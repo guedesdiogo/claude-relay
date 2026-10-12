@@ -25,9 +25,12 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run tests
         run: python -m unittest discover -s tests -v
+      - name: Check install.sh
+        run: sh -n install.sh
       - name: Smoke test the CLI
         run: |
-          python bin/claude-session-restorer --version
+          python bin/claude-relay --version
+          python bin/claude-relay --help
           python bin/claude-session-restorer --help
 
   versions:
@@ -38,7 +41,7 @@ jobs:
       - name: Compare package.json and the CLI
         run: |
           PKG=$(node -p "require('./package.json').version")
-          CLI=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' bin/claude-session-restorer)
+          CLI=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' bin/claude-relay)
           echo "package.json=$PKG cli=$CLI"
           test "$PKG" = "$CLI"
 
@@ -53,5 +56,6 @@ jobs:
       - name: Pack and run from the tarball
         run: |
           npm pack
-          npm install -g ./guedesdiogo-claude-session-restorer-*.tgz
-          claude-session-restorer --version
+          npm install -g ./guedesdiogo-claude-relay-*.tgz
+          claude-relay --version
+          claude-session-restorer --help

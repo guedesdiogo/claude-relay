@@ -1,0 +1,1524 @@
+#!/usr/bin/env python3
+"""
+claude-relay
+------------
+Use several Claude subscriptions as one, without losing your sessions.
+
+  claude-relay run [claude args]   Start Claude Code in the terminal. When the current
+                                   account reaches its usage threshold (or hits its limit),
+                                   claude-relay switches to the next account and resumes
+                                   the same session automatically.
+  claude-relay accounts ...        Add, list and remove accounts (one long-lived token each,
+                                   from `claude setup-token`).
+  claude-relay desktop [options]   After switching accounts in Claude Desktop (macOS):
+                                   bring your Code-tab sessions to the new account and
+                                   restart Claude Desktop's helpers on your SSH hosts.
+  claude-relay remote ...          Manage the SSH hosts used by `desktop`.
+  claude-relay config ...          Show or change settings (threshold, continue prompt...).
+
+The `desktop` command is a macOS port of restore-code-tab-sessions.ps1 from
+https://github.com/sahol3/claude-code-session-restorer (MIT).
+
+Unofficial tool. It relies on documented Claude Code features (CLAUDE_CODE_OAUTH_TOKEN,
+status line rate_limits, hooks, --resume) and, for `desktop`, on Claude Desktop files whose
+format was worked out by observation and may change in any update.
+"""
+import argparse
+import getpass
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "2.0.0"
+
+PROG = "claude-relay"
+HOME = Path.home()
+IS_MAC = sys.platform == "darwin"
+
+# Claude Code / Claude Desktop locations
+DEFAULT_PROJECTS = HOME / ".claude" / "projects"
+DEFAULT_CARDS = HOME / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+CLAUDE_JSON = HOME / ".claude.json"
+APP_NAME = "Claude"
+DESKTOP_CONFIG_FILES = ("config.json", "claude_desktop_config.json")
+
+# claude-relay's own files
+RELAY_HOME = Path(os.environ.get("CLAUDE_RELAY_HOME") or
+                  Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "claude-relay")
+CONFIG_FILE = RELAY_HOME / "config.json"
+STATE_FILE = RELAY_HOME / "state.json"
+LOCK_FILE = RELAY_HOME / ".lock"
+RUNS_DIR = RELAY_HOME / "runs"
+TOKENS_DIR = RELAY_HOME / "tokens"
+KEYCHAIN_SERVICE = "claude-relay"
+
+DEFAULT_CONFIG = {
+    "accounts": [],               # [{"name": "work", "store": "keychain"|"file"}]
+    "threshold": 95,              # switch at this % of the 5-hour or weekly window; 100 = only on the limit
+    "continue_prompt": "Continue exactly where you left off.",
+    "cooldown_minutes": 30,       # how long to skip an account that hit its limit when the reset time is unknown
+    "claude_bin": "claude",
+    "remotes": [],                # SSH hosts where Claude Desktop runs remote sessions
+    "notify": True,               # macOS notification when an account switch happens
+}
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{20,}$")
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+COLORS = {"gray": "90", "white": "97", "cyan": "36", "green": "32", "yellow": "33", "red": "31"}
+
+
+def say(msg, color="gray", err=False):
+    stream = sys.stderr if err else sys.stdout
+    color_ok = stream.isatty() and os.environ.get("NO_COLOR") is None
+    stream.write(f"\033[{COLORS[color]}m{msg}\033[0m\n" if color_ok else f"{msg}\n")
+    stream.flush()
+
+
+def die(msg, code=1):
+    say(msg, "red", err=True)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# Small file helpers
+# ---------------------------------------------------------------------------
+def load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_json(path, data, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+class Locked:
+    """Process-wide lock around state updates (several terminals may run claude-relay at once)."""
+
+    def __enter__(self):
+        RELAY_HOME.mkdir(parents=True, exist_ok=True)
+        self.fh = open(LOCK_FILE, "a")
+        try:
+            import fcntl
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            import fcntl
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        self.fh.close()
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    data = load_json(CONFIG_FILE)
+    if isinstance(data, dict):
+        cfg.update(data)
+    cfg["accounts"] = [a for a in cfg.get("accounts") or [] if isinstance(a, dict) and a.get("name")]
+    return cfg
+
+
+def save_config(cfg):
+    write_json(CONFIG_FILE, cfg)
+
+
+def load_state():
+    st = load_json(STATE_FILE)
+    st = st if isinstance(st, dict) else {}
+    st.setdefault("active", None)
+    st.setdefault("usage", {})
+    st.setdefault("exhausted", {})
+    return st
+
+
+def update_state(fn):
+    with Locked():
+        st = load_state()
+        fn(st)
+        write_json(STATE_FILE, st)
+        return st
+
+
+def run_file(run_id):
+    return RUNS_DIR / f"{run_id}.json"
+
+
+def load_run(run_id):
+    data = load_json(run_file(run_id))
+    return data if isinstance(data, dict) else {}
+
+
+def update_run(run_id, fn):
+    with Locked():
+        data = load_run(run_id)
+        fn(data)
+        write_json(run_file(run_id), data)
+        return data
+
+
+# ---------------------------------------------------------------------------
+# Token storage: macOS Keychain or a 0600 file
+# ---------------------------------------------------------------------------
+def default_store():
+    forced = os.environ.get("CLAUDE_RELAY_TOKEN_STORE")
+    if forced in ("keychain", "file"):
+        return forced
+    return "keychain" if IS_MAC and shutil.which("security") else "file"
+
+
+def token_set(name, token, store):
+    if store == "keychain":
+        # `security -i` reads the command from stdin, so the token never appears in `ps`.
+        cmd = f'add-generic-password -U -s "{KEYCHAIN_SERVICE}" -a "{name}" -w "{token}"\n'
+        r = subprocess.run(["security", "-i"], input=cmd, capture_output=True, text=True)
+        if r.returncode != 0 or "error" in (r.stderr or "").lower():
+            die(f"Could not save the token in the macOS Keychain: {(r.stderr or r.stdout).strip()}")
+    else:
+        TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(TOKENS_DIR, 0o700)
+        path = TOKENS_DIR / name
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token + "\n")
+        os.chmod(path, 0o600)
+
+
+def token_get(name, store):
+    if store == "keychain":
+        r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name, "-w"],
+                           capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+    path = TOKENS_DIR / name
+    try:
+        return path.read_text().strip() or None
+    except Exception:
+        return None
+
+
+def token_delete(name, store):
+    if store == "keychain":
+        subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name],
+                       capture_output=True, text=True)
+    else:
+        try:
+            (TOKENS_DIR / name).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def parse_token_text(text):
+    """Accept a raw token or a line like `export CLAUDE_CODE_OAUTH_TOKEN=...`."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.search(r"CLAUDE_CODE_OAUTH_TOKEN\s*=\s*['\"]?([^'\"\s]+)", line)
+        candidate = m.group(1) if m else line
+        if TOKEN_RE.match(candidate):
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Account availability
+# ---------------------------------------------------------------------------
+WINDOWS = (("five_hour", "5h"), ("seven_day", "7d"))
+
+
+def account_block(name, state, threshold, now=None):
+    """Return None if the account can be used, otherwise (reason, until_epoch_or_None)."""
+    now = now or time.time()
+    ex = (state.get("exhausted") or {}).get(name)
+    until, why = (ex.get("until"), ex.get("reason") or "hit its limit") if isinstance(ex, dict) else (ex, "hit its limit")
+    if until and until > now:
+        return (why, until)
+    usage = (state.get("usage") or {}).get(name) or {}
+    limit = min(max(int(threshold), 1), 100)
+    for key, label in WINDOWS:
+        w = usage.get(key) or {}
+        used, resets = w.get("used"), w.get("resets_at")
+        if used is None:
+            continue
+        if resets and resets <= now:
+            continue  # window already reset
+        if used >= limit:
+            return (f"{label} window at {used:.0f}%", resets)
+    return None
+
+
+def choose_account(cfg, state, exclude=(), prefer=None):
+    names = [a["name"] for a in cfg["accounts"]]
+    if not names:
+        return None
+    start = prefer if prefer in names else (state.get("active") if state.get("active") in names else names[0])
+    i = names.index(start)
+    for name in names[i:] + names[:i]:
+        if name in exclude:
+            continue
+        if account_block(name, state, cfg["threshold"]) is None:
+            return name
+    return None
+
+
+def fmt_time(epoch):
+    if not epoch:
+        return "unknown"
+    return datetime.fromtimestamp(epoch).strftime("%a %d %b %H:%M")
+
+
+def usage_summary(name, state):
+    usage = (state.get("usage") or {}).get(name) or {}
+    parts = []
+    for key, label in WINDOWS:
+        w = usage.get(key) or {}
+        if w.get("used") is not None:
+            parts.append(f"{label} {w['used']:.0f}%")
+    return " · ".join(parts) if parts else "no usage seen yet"
+
+
+def notify(cfg, title, text):
+    if not (IS_MAC and cfg.get("notify") and not os.environ.get("CLAUDE_RELAY_NO_NOTIFY")):
+        return
+    script = f"display notification {json.dumps(text)} with title {json.dumps(title)}"
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# `claude-relay accounts | use | config`
+# ---------------------------------------------------------------------------
+def find_account(cfg, name):
+    for a in cfg["accounts"]:
+        if a["name"] == name:
+            return a
+    return None
+
+
+def cmd_accounts_add(args):
+    name = args.name
+    if not NAME_RE.match(name):
+        die("Account names may use letters, digits, '.', '_' and '-' (max 64 characters).")
+    store = args.store or default_store()
+    if store == "keychain" and not (IS_MAC and shutil.which("security")):
+        die("The keychain store is only available on macOS. Use --store file.")
+    if args.token_file:
+        token = parse_token_text(Path(args.token_file).expanduser().read_text())
+    elif not sys.stdin.isatty():
+        token = parse_token_text(sys.stdin.read())
+    else:
+        say(f"Paste the long-lived token for '{name}'. Create it with `claude setup-token` while signed in", "cyan")
+        say("to that account in your browser. The token is hidden while you paste.", "cyan")
+        token = parse_token_text(getpass.getpass("Token: "))
+    if not token:
+        die("That does not look like a token from `claude setup-token`.")
+    token_set(name, token, store)
+
+    def upd(cfg):
+        existing = find_account(cfg, name)
+        if existing:
+            existing["store"] = store
+        else:
+            cfg["accounts"].append({"name": name, "store": store})
+        return cfg
+
+    with Locked():
+        cfg = upd(load_config())
+        save_config(cfg)
+    update_state(lambda st: st.update(active=st.get("active") or name))
+    say(f"Saved account '{name}' ({'macOS Keychain' if store == 'keychain' else TOKENS_DIR / name}).", "green")
+    return 0
+
+
+def cmd_accounts_list(args):
+    cfg, state = load_config(), load_state()
+    if not cfg["accounts"]:
+        say(f"No accounts yet. Add one with: {PROG} accounts add <name>", "yellow")
+        return 0
+    thr = cfg["threshold"]
+    say(f"Switch threshold: {thr}%{' (only when the limit is hit)' if thr >= 100 else ''}", "cyan")
+    for a in cfg["accounts"]:
+        name = a["name"]
+        mark = "*" if name == state.get("active") else " "
+        block = account_block(name, state, thr)
+        status = "available" if block is None else f"skipped until {fmt_time(block[1])} ({block[0]})"
+        has_token = token_get(name, a.get("store", "file")) is not None
+        token_note = "" if has_token else "  [token missing]"
+        say(f" {mark} {name:<16} {usage_summary(name, state):<22} {status}{token_note}",
+            "white" if block is None else "yellow")
+    return 0
+
+
+def cmd_accounts_remove(args):
+    with Locked():
+        cfg = load_config()
+        acc = find_account(cfg, args.name)
+        if not acc:
+            die(f"No account named '{args.name}'.")
+        cfg["accounts"] = [a for a in cfg["accounts"] if a["name"] != args.name]
+        save_config(cfg)
+    token_delete(args.name, acc.get("store", "file"))
+
+    def upd(st):
+        st["usage"].pop(args.name, None)
+        st["exhausted"].pop(args.name, None)
+        if st.get("active") == args.name:
+            st["active"] = cfg["accounts"][0]["name"] if cfg["accounts"] else None
+    update_state(upd)
+    say(f"Removed account '{args.name}' and its token.", "green")
+    return 0
+
+
+def cmd_use(args):
+    cfg = load_config()
+    if not find_account(cfg, args.name):
+        die(f"No account named '{args.name}'.")
+
+    def upd(st):
+        st["active"] = args.name
+        st["exhausted"].pop(args.name, None)
+    update_state(upd)
+    say(f"Active account: {args.name}", "green")
+    return 0
+
+
+def cmd_reset(args):
+    def upd(st):
+        names = [args.name] if args.name else list(st["usage"].keys()) + list(st["exhausted"].keys())
+        for n in names:
+            st["usage"].pop(n, None)
+            st["exhausted"].pop(n, None)
+    update_state(upd)
+    say("Forgot the recorded usage; accounts will be tried again.", "green")
+    return 0
+
+
+CONFIG_KEYS = {
+    "threshold": int, "continue_prompt": str, "cooldown_minutes": int, "claude_bin": str, "notify": None,
+}
+
+
+def cmd_config(args):
+    with Locked():
+        cfg = load_config()
+        if args.key is None:
+            shown = {k: v for k, v in cfg.items() if k != "accounts"}
+            shown["accounts"] = [a["name"] for a in cfg["accounts"]]
+            print(json.dumps(shown, indent=2, ensure_ascii=False))
+            return 0
+        if args.key not in CONFIG_KEYS:
+            die(f"Unknown setting '{args.key}'. Settings: {', '.join(CONFIG_KEYS)}")
+        if args.value is None:
+            print(cfg.get(args.key))
+            return 0
+        if args.key == "threshold":
+            v = int(args.value)
+            if not 1 <= v <= 100:
+                die("threshold must be between 1 and 100 (100 = switch only when the limit is hit).")
+        elif args.key == "notify":
+            v = args.value.lower() in ("1", "true", "yes", "on")
+        else:
+            v = CONFIG_KEYS[args.key](args.value)
+        cfg[args.key] = v
+        save_config(cfg)
+    say(f"{args.key} = {v}", "green")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# `claude-relay run`: the terminal wrapper
+# ---------------------------------------------------------------------------
+# Claude Code flags (https://code.claude.com/docs/en/cli-reference) that take a value.
+VALUE_OPTS = {
+    "--advisor", "--agent", "--agents", "--append-system-prompt", "--append-system-prompt-file",
+    "--append-subagent-system-prompt", "--append-subagent-system-prompt-file", "--autocompact",
+    "--betas", "--cloud", "--debug-file", "--effort", "--environment", "--exec", "--fallback-model",
+    "--from-pr", "--input-format", "--json-schema", "--max-budget-usd", "--max-turns", "--model",
+    "--name", "-n", "--output-format", "--permission-mode", "--permission-prompt-tool",
+    "--permission-prompts", "--plugin-dir", "--ref", "--remote-control-session-name-prefix",
+    "--setting-sources", "--settings", "--system-prompt", "--system-prompt-file",
+    "--system-prompt-snapshot", "--teammate-mode", "--tools",
+}
+VARIADIC_OPTS = {
+    "--add-dir", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
+    "--mcp-config", "--channels", "--plugin-url",
+}
+OPTIONAL_VALUE_OPTS = {"--debug", "-w", "--worktree", "--tmux", "--remote-control", "--rc"}
+# Dropped when claude-relay restarts Claude on another account (it adds its own --resume).
+DROP_FLAGS = {"-c", "--continue"}
+DROP_WITH_OPTIONAL_VALUE = {"-r", "--resume"}
+DROP_WITH_VALUE = {"--session-id"}
+
+
+def split_settings_arg(argv):
+    """Remove the user's --settings (we merge it into ours). Returns (argv, settings_dict)."""
+    out, user = [], {}
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        val = None
+        if tok == "--settings" and i + 1 < len(argv):
+            val = argv[i + 1]
+            i += 2
+        elif tok.startswith("--settings="):
+            val = tok.split("=", 1)[1]
+            i += 1
+        else:
+            out.append(tok)
+            i += 1
+            continue
+        loaded = None
+        try:
+            loaded = json.loads(val)
+        except Exception:
+            loaded = load_json(Path(val).expanduser())
+        if isinstance(loaded, dict):
+            user = deep_merge(user, loaded)
+    return out, user
+
+
+def restart_args(argv):
+    """Keep the user's options, drop the initial prompt and any resume/continue flags."""
+    out = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        nxt = argv[i + 1] if i + 1 < n else None
+        if tok == "--":
+            break  # everything after is the prompt
+        if tok.startswith("--") and "=" in tok:
+            if tok.split("=", 1)[0] not in (DROP_WITH_OPTIONAL_VALUE | DROP_WITH_VALUE):
+                out.append(tok)
+            i += 1
+            continue
+        if tok in DROP_FLAGS:
+            i += 1
+            continue
+        if tok in DROP_WITH_OPTIONAL_VALUE:
+            i += 2 if (nxt is not None and not nxt.startswith("-")) else 1
+            continue
+        if tok in DROP_WITH_VALUE:
+            i += 2
+            continue
+        if tok in VALUE_OPTS:
+            out.append(tok)
+            if nxt is not None:
+                out.append(nxt)
+            i += 2
+            continue
+        if tok in VARIADIC_OPTS:
+            out.append(tok)
+            i += 1
+            while i < n and not argv[i].startswith("-"):
+                out.append(argv[i])
+                i += 1
+            continue
+        if tok in OPTIONAL_VALUE_OPTS:
+            out.append(tok)
+            if nxt is not None and not nxt.startswith("-") and not re.search(r"\s", nxt):
+                out.append(nxt)
+                i += 2
+            else:
+                i += 1
+            continue
+        if tok.startswith("-"):
+            out.append(tok)  # boolean flag
+            i += 1
+            continue
+        i += 1  # positional: the initial prompt, already sent
+    return out
+
+
+def is_print_mode(argv):
+    return any(t in ("-p", "--print") for t in argv)
+
+
+def deep_merge(base, extra):
+    out = dict(base)
+    for k, v in extra.items():
+        if k == "hooks" and isinstance(v, dict) and isinstance(out.get(k), dict):
+            merged = {ev: list(lst) for ev, lst in out[k].items()}
+            for ev, lst in v.items():
+                merged.setdefault(ev, [])
+                merged[ev] = merged[ev] + list(lst)
+            out[k] = merged
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def self_command():
+    return f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+
+
+def relay_settings(user_settings):
+    me = self_command()
+
+    def hook(event):
+        return [{"hooks": [{"type": "command", "command": f"{me} _hook {event}", "timeout": 30}]}]
+
+    ours = {
+        "statusLine": {"type": "command", "command": f"{me} _statusline", "padding": 0},
+        "hooks": {
+            "SessionStart": hook("session-start"),
+            "Stop": hook("stop"),
+            "StopFailure": [{"matcher": "rate_limit|billing_error|authentication_failed",
+                             "hooks": [{"type": "command", "command": f"{me} _hook stop-failure", "timeout": 30}]}],
+        },
+    }
+    return deep_merge({k: v for k, v in user_settings.items() if k != "statusLine"}, ours)
+
+
+def find_user_statusline(user_settings, cwd):
+    """The status line the user would see without claude-relay (highest settings level wins)."""
+    if isinstance(user_settings.get("statusLine"), dict):
+        return user_settings["statusLine"]
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude").expanduser()
+    for path in (Path(cwd) / ".claude" / "settings.local.json", Path(cwd) / ".claude" / "settings.json",
+                 config_dir / "settings.json"):
+        data = load_json(path)
+        if isinstance(data, dict) and isinstance(data.get("statusLine"), dict):
+            return data["statusLine"]
+    return None
+
+
+def restore_terminal():
+    if sys.stdin.isatty():
+        subprocess.run(["stty", "sane"], stdin=sys.stdin, capture_output=True)
+        sys.stderr.write("\033[?25h\033[0m\n")
+        sys.stderr.flush()
+
+
+def stop_child(proc, grace=10.0):
+    if proc.poll() is not None:
+        return
+    try:
+        proc.send_signal(signal.SIGTERM)
+    except Exception:
+        return
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return
+        time.sleep(0.2)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    proc.wait()
+
+
+def print_availability(cfg, state):
+    for a in cfg["accounts"]:
+        block = account_block(a["name"], state, cfg["threshold"])
+        if block:
+            say(f"  {a['name']}: {block[0]}, available again {fmt_time(block[1])}", "yellow", err=True)
+        else:
+            say(f"  {a['name']}: available", "white", err=True)
+
+
+def cmd_run(claude_args):
+    cfg = load_config()
+    if not cfg["accounts"]:
+        die(f"No accounts configured. Add them first:\n  {PROG} accounts add <name>   "
+            "(paste a token from `claude setup-token`)")
+    claude_bin = os.environ.get("CLAUDE_RELAY_CLAUDE_BIN") or cfg.get("claude_bin") or "claude"
+    if not shutil.which(claude_bin) and not os.path.exists(claude_bin):
+        die(f"Could not find '{claude_bin}'. Install Claude Code or set: {PROG} config claude_bin <path>")
+
+    argv, user_settings = split_settings_arg(list(claude_args))
+    printing = is_print_mode(argv)
+    later_args = restart_args(argv)
+    settings_json = json.dumps(relay_settings(user_settings), separators=(",", ":"))
+
+    run_id = uuid.uuid4().hex[:12]
+    write_json(run_file(run_id), {"pid": os.getpid(), "started": time.time()})
+
+    stripped = [v for v in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN") if os.environ.get(v)]
+    if stripped:
+        say(f"{PROG}: ignoring {', '.join(stripped)} so the subscription tokens are used.", "yellow", err=True)
+
+    # Our own Ctrl+C handler (not SIG_IGN) so Claude, after exec, gets the default behaviour.
+    signal.signal(signal.SIGINT, lambda *a: None)
+
+    user_statusline = find_user_statusline(user_settings, os.getcwd())
+
+    launched = False
+    resume_session = None
+    prompt = None
+    current = None
+    tried = set()
+    exit_code = 0
+    try:
+        while True:
+            state = load_state()
+            current = choose_account(cfg, state, exclude=tried, prefer=current)
+            if current is None:
+                say(f"{PROG}: no account is available right now.", "red", err=True)
+                print_availability(cfg, state)
+                return exit_code if launched else 2
+            acc = find_account(cfg, current)
+            token = token_get(current, acc.get("store", "file"))
+            if not token:
+                say(f"{PROG}: no token stored for '{current}'. Run: {PROG} accounts add {current}", "red", err=True)
+                tried.add(current)
+                continue
+            update_state(lambda st: st.update(active=current))
+
+            args = list(later_args) if launched else list(argv)
+            if resume_session:
+                args += ["--resume", resume_session]
+                if prompt:
+                    args.append(prompt)
+            cmd = [claude_bin] + args + ["--settings", settings_json]
+            env = dict(os.environ)
+            for v in stripped:
+                env.pop(v, None)
+            env.update({"CLAUDE_CODE_OAUTH_TOKEN": token, "CLAUDE_RELAY_RUN": run_id,
+                        "CLAUDE_RELAY_ACCOUNT": current, "CLAUDE_RELAY_HOME": str(RELAY_HOME)})
+            if user_statusline:
+                env["CLAUDE_RELAY_USER_STATUSLINE"] = json.dumps(user_statusline)
+            update_run(run_id, lambda r: r.update(account=current, request=None, pending=None,
+                                                  blocked=None, session_id=resume_session or r.get("session_id")))
+            say(f"{PROG}: account '{current}' ({usage_summary(current, state)})"
+                + (f", resuming {resume_session}" if resume_session else ""), "cyan", err=True)
+
+            proc = subprocess.Popen(cmd, env=env)
+            launched = True
+            switch = None
+            while True:
+                try:
+                    proc.wait(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                req = load_run(run_id).get("request")
+                if not req:
+                    continue
+                state = load_state()
+                nxt = choose_account(cfg, state, exclude={current})
+                if nxt is None:
+                    update_run(run_id, lambda r: r.update(request=None, blocked=req.get("reason")))
+                    continue
+                switch = req
+                time.sleep(1.5)  # let Claude finish writing the transcript
+                stop_child(proc)
+                break
+
+            exit_code = proc.returncode if proc.returncode is not None else 1
+            if switch is None:
+                # Claude exited on its own. In -p mode a usage limit ends the run: continue elsewhere.
+                # Claude may exit before the StopFailure hook finishes, so also read the transcript.
+                run = load_run(run_id)
+                if printing and exit_code != 0 and not run.get("request") and run.get("transcript_path"):
+                    failure = last_api_error(run["transcript_path"])
+                    if failure:
+                        handle_failure(run_id, current, run.get("session_id"), *failure)
+                req = load_run(run_id).get("request")
+                if printing and req and req.get("session_id"):
+                    switch = req
+                else:
+                    return exit_code
+            if not printing:
+                restore_terminal()
+            old = current
+            resume_session = switch.get("session_id") or load_run(run_id).get("session_id")
+            if not resume_session:
+                say(f"{PROG}: switching accounts but the session id is unknown; starting fresh.", "yellow", err=True)
+            prompt = cfg["continue_prompt"] if switch.get("mid_turn") else None
+            tried = {old}
+            nxt = choose_account(cfg, load_state(), exclude=tried)
+            if nxt is None:
+                say(f"{PROG}: '{old}' {switch.get('reason', 'reached its limit')} and no other account is "
+                    "available.", "red", err=True)
+                print_availability(cfg, load_state())
+                return exit_code
+            msg = f"'{old}' {switch.get('reason', 'reached its limit')}; switching to '{nxt}'"
+            say(f"{PROG}: {msg}.", "yellow", err=True)
+            notify(cfg, "claude-relay", msg)
+            current = nxt
+    finally:
+        try:
+            run_file(run_id).unlink()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Internal commands called by Claude Code (status line and hooks)
+# ---------------------------------------------------------------------------
+def read_stdin_json():
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def run_user_statusline(spec_json, raw_input):
+    try:
+        spec = json.loads(spec_json)
+    except Exception:
+        return ""
+    if not isinstance(spec, dict) or spec.get("type") != "command" or not spec.get("command"):
+        return ""
+    if "_statusline" in spec["command"] and PROG in spec["command"]:
+        return ""
+    try:
+        r = subprocess.run(spec["command"], shell=True, input=raw_input, capture_output=True, text=True,
+                           timeout=5)
+        return r.stdout.rstrip("\n")
+    except Exception:
+        return ""
+
+
+def internal_statusline():
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw or "{}")
+    except Exception:
+        data = {}
+    run_id = os.environ.get("CLAUDE_RELAY_RUN")
+    account = os.environ.get("CLAUDE_RELAY_ACCOUNT")
+    cfg = load_config()
+    threshold = cfg["threshold"]
+    rl = data.get("rate_limits") if isinstance(data, dict) else None
+    crossed = None
+    if account and isinstance(rl, dict):
+        snap = {"updated": time.time()}
+        for key, label in WINDOWS:
+            w = rl.get(key)
+            if isinstance(w, dict) and w.get("used_percentage") is not None:
+                used = float(w["used_percentage"])
+                snap[key] = {"used": used, "resets_at": w.get("resets_at")}
+                if threshold < 100 and used >= threshold and crossed is None:
+                    crossed = f"reached {used:.0f}% of its {label} window"
+        update_state(lambda st: st["usage"].__setitem__(account, {**(st["usage"].get(account) or {}), **snap}))
+    run = {}
+    if run_id:
+        sid = data.get("session_id") if isinstance(data, dict) else None
+
+        def upd(r):
+            if sid:
+                r["session_id"] = sid
+            if crossed and not r.get("pending") and not r.get("request"):
+                r["pending"] = crossed
+        run = update_run(run_id, upd)
+
+    lines = []
+    user_spec = os.environ.get("CLAUDE_RELAY_USER_STATUSLINE")
+    if user_spec:
+        out = run_user_statusline(user_spec, raw)
+        if out:
+            lines.append(out)
+    state = load_state()
+    if account:
+        info = f"⇄ {account} · {usage_summary(account, state)}"
+        if run.get("blocked"):
+            info += " · no other account available"
+        elif run.get("pending"):
+            info += " · switching after this turn"
+        lines.append(f"\033[2m{info}\033[0m")
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def looks_like_capacity_error(text):
+    """A temporary 429 ("this may be a temporary capacity issue"), not the account's usage limit."""
+    t = (text or "").lower().replace("rate_limit", "")
+    return "capacity" in t and not re.search(r"hit your|usage limit|weekly limit|session limit", t)
+
+
+def transcript_tail(path, max_bytes=20000):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            return f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+SWITCH_ERRORS = ("rate_limit", "billing_error", "authentication_failed")
+
+
+def handle_failure(run_id, account, sid, error, message):
+    """Decide whether a failed turn means this account cannot be used, and if so ask for a switch.
+
+    `error` is Claude Code's StopFailure type (verified with Claude Code 2.1.296: "rate_limit",
+    "authentication_failed", ...) and `message` the error text shown to the user."""
+    error, message = str(error or ""), str(message or "")
+    if error and error not in SWITCH_ERRORS:
+        return False
+    if error in ("", "rate_limit") and looks_like_capacity_error(message):
+        return False  # a temporary 429, not this account's limit
+    cfg = load_config()
+    cooldown = time.time() + 60 * int(cfg.get("cooldown_minutes") or 30)
+    if error == "authentication_failed":
+        reason, short, until = ("had its token rejected (run `claude-relay accounts add` again)",
+                                "token rejected", time.time() + 86400)
+    elif error == "billing_error":
+        reason, short, until = "has a billing problem", "billing problem", cooldown
+    else:
+        usage = (load_state().get("usage") or {}).get(account) or {}
+        resets = [w.get("resets_at") for k, _ in WINDOWS for w in [usage.get(k) or {}]
+                  if (w.get("used") or 0) >= 99 and w.get("resets_at")]
+        reason, short, until = "hit its usage limit", "hit its usage limit", (max(resets) if resets else cooldown)
+    if account:
+        update_state(lambda st: st["exhausted"].__setitem__(account, {"until": until, "reason": short}))
+
+    def upd(r):
+        if sid:
+            r["session_id"] = sid
+        r["request"] = {"session_id": r.get("session_id"), "reason": reason, "mid_turn": True}
+    update_run(run_id, upd)
+    return True
+
+
+def last_api_error(transcript_path):
+    """(error, message) if the transcript's last assistant entry is an API error, else None.
+
+    Claude Code records failed turns as {"type": "assistant", "isApiErrorMessage": true,
+    "error": "<type>", "message": {"content": [{"text": "..."}]}}."""
+    last = None
+    for line in transcript_tail(transcript_path, 200000).splitlines():
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(o, dict) and o.get("type") == "assistant":
+            last = o
+    if not last or not last.get("isApiErrorMessage"):
+        return None
+    content = (last.get("message") or {}).get("content")
+    text = content if isinstance(content, str) else " ".join(
+        p.get("text", "") for p in content or [] if isinstance(p, dict))
+    return str(last.get("error") or ""), text
+
+
+def internal_hook(event):
+    data = read_stdin_json()
+    run_id = os.environ.get("CLAUDE_RELAY_RUN")
+    account = os.environ.get("CLAUDE_RELAY_ACCOUNT")
+    if not run_id:
+        return 0
+    sid = data.get("session_id")
+    tpath = data.get("transcript_path")
+
+    def remember(r):
+        if sid:
+            r["session_id"] = sid
+        if tpath:
+            r["transcript_path"] = tpath
+
+    if event == "session-start":
+        update_run(run_id, remember)
+    elif event == "stop":
+        def upd(r):
+            remember(r)
+            if r.get("pending") and not r.get("request"):
+                r["request"] = {"session_id": r.get("session_id"), "reason": r["pending"], "mid_turn": False}
+        update_run(run_id, upd)
+    elif event == "stop-failure":
+        update_run(run_id, remember)
+        message = data.get("last_assistant_message") or transcript_tail(tpath or "")
+        handle_failure(run_id, account, sid, data.get("error"), message)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# `claude-relay desktop`: Claude Desktop account switch (macOS)
+# ---------------------------------------------------------------------------
+def iter_cards(root):
+    if not root.exists():
+        return []
+    return [p for p in root.rglob("local_*.json") if p.is_file()]
+
+
+def desktop_running():
+    try:
+        r = subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True, text=True)
+        return [pid for pid in r.stdout.split() if pid]
+    except Exception:
+        return []
+
+
+def quit_desktop(timeout=30):
+    if not desktop_running():
+        return True
+    say("Quitting Claude Desktop...", "cyan")
+    try:
+        subprocess.run(["osascript", "-e", f'quit app "{APP_NAME}"'], capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not desktop_running():
+            time.sleep(1)  # let the app finish writing its files
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def open_desktop():
+    try:
+        subprocess.run(["open", "-a", APP_NAME], capture_output=True, text=True, timeout=15)
+        say("Claude Desktop reopened.", "cyan")
+    except Exception:
+        say("Could not reopen Claude Desktop; open it manually.", "yellow")
+
+
+def to_epoch_ms(iso, fallback_ts):
+    if iso:
+        try:
+            s = str(iso).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            m = re.match(r"^(.*?\.)(\d+)(.*)$", s)
+            if m:
+                s = m.group(1) + (m.group(2) + "000000")[:6] + m.group(3)
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            pass
+    return int(fallback_ts * 1000)
+
+
+SKIP_USER = [
+    re.compile(r"^\s*<"),
+    re.compile(r"^This session is being continued"),
+    re.compile(r"^\s*Caveat:"),
+    re.compile(r"^Base directory for this skill"),
+]
+
+
+def get_meta(path):
+    """Read cwd, creation timestamp and a title from the first 400 lines of a transcript."""
+    cwd = created = ai = summ = usr = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f, 1):
+                if i > 400:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(o, dict):
+                    continue
+                if not created and o.get("timestamp"):
+                    created = o["timestamp"]
+                if not cwd and o.get("cwd"):
+                    cwd = o["cwd"]
+                if not ai and o.get("type") == "ai-title" and o.get("aiTitle"):
+                    ai = o["aiTitle"]
+                if not summ and o.get("type") == "summary" and o.get("summary"):
+                    summ = o["summary"]
+                if not usr and o.get("type") == "user" and isinstance(o.get("message"), dict):
+                    c = o["message"].get("content")
+                    txt = None
+                    if isinstance(c, str):
+                        txt = c
+                    elif isinstance(c, list):
+                        for part in c:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                txt = part.get("text")
+                                break
+                    if txt and not any(rx.search(txt) for rx in SKIP_USER):
+                        usr = txt
+                if cwd and created and ai:
+                    break
+    except Exception:
+        pass
+    title = ai or (re.sub(r"\s+", " ", summ) if summ else None) or (re.sub(r"\s+", " ", usr) if usr else None)
+    if title and len(title) > 80:
+        title = title[:80]
+    return cwd, created, title
+
+
+def find_key(obj, key):
+    """Return the first string value stored under `key` anywhere in a JSON structure."""
+    if isinstance(obj, dict):
+        v = obj.get(key)
+        if isinstance(v, str) and v:
+            return v
+        children = obj.values()
+    elif isinstance(obj, list):
+        children = obj
+    else:
+        return None
+    for child in children:
+        found = find_key(child, key)
+        if found:
+            return found
+    return None
+
+
+def read_desktop_account(app_dir):
+    """Account Claude Desktop is signed into (it does not update ~/.claude.json)."""
+    for name in DESKTOP_CONFIG_FILES:
+        path = app_dir / name
+        if path.exists():
+            acct = find_key(load_json(path), "lastKnownAccountUuid")
+            if acct:
+                return acct, path
+    return None, None
+
+
+def read_cli_account():
+    if not CLAUDE_JSON.exists():
+        return None
+    cj = load_json(CLAUDE_JSON)
+    if isinstance(cj, dict):
+        oa = cj.get("oauthAccount") or {}
+        a, o = oa.get("accountUuid"), oa.get("organizationUuid")
+        if a and o:
+            return a, o, oa.get("emailAddress")
+    try:
+        raw = CLAUDE_JSON.read_text(encoding="utf-8", errors="replace")
+        m = re.search(
+            r'"oauthAccount"\s*:\s*\{[\s\S]*?"accountUuid"\s*:\s*"([0-9a-fA-F\-]+)"'
+            r'[\s\S]*?"organizationUuid"\s*:\s*"([0-9a-fA-F\-]+)"',
+            raw,
+        )
+        if m:
+            return m.group(1), m.group(2), None
+    except Exception:
+        pass
+    return None
+
+
+def resolve_org(cards_root, acct, cli):
+    """Pick the organization folder for an account; Claude Desktop creates it on first use."""
+    acct_dir = cards_root / acct
+    orgs = sorted((p for p in acct_dir.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime,
+                  reverse=True) if acct_dir.is_dir() else []
+    if cli and cli[0] == acct:
+        if not orgs or any(p.name == cli[1] for p in orgs):
+            return cli[1]
+    if orgs:
+        return orgs[0].name
+    return None
+
+
+def read_current_account(cards_root):
+    """Return (account, org, source, problem). Claude Desktop's own config wins over ~/.claude.json."""
+    cli = read_cli_account()
+    acct, path = read_desktop_account(cards_root.parent)
+    if acct:
+        org = resolve_org(cards_root, acct, cli)
+        if org:
+            return acct, org, str(path), None
+        return acct, None, str(path), (
+            f"Claude Desktop is signed in as {acct}, but it has no session folder yet. "
+            "Open the Code tab in Claude Desktop once, then run again.")
+    if cli:
+        return cli[0], cli[1], str(CLAUDE_JSON), None
+    return None, None, None, (
+        f"Could not read the logged-in account from Claude Desktop ({cards_root.parent}) "
+        f"or from {CLAUDE_JSON}.")
+
+
+def same_dir(a, b):
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except Exception:
+        return str(a) == str(b)
+
+
+def make_backup(cards_root):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bk = Path(f"{cards_root}_backup_{stamp}")
+    n = 2
+    while bk.exists():
+        bk = Path(f"{cards_root}_backup_{stamp}_{n}")
+        n += 1
+    shutil.copytree(cards_root, bk)
+    return bk
+
+
+def desktop_list(cards_root):
+    say(f"Card folder: {cards_root}", "cyan")
+    if not cards_root.exists():
+        say("The folder does not exist. Open the Code tab in Claude Desktop at least once, "
+            "or point to the right folder with --cards-dir.", "yellow")
+        return 1
+    acct, org, source, problem = read_current_account(cards_root)
+    found = False
+    for acct_dir in sorted(p for p in cards_root.iterdir() if p.is_dir()):
+        for org_dir in sorted(p for p in acct_dir.iterdir() if p.is_dir()):
+            found = True
+            n = len(list(org_dir.glob("local_*.json")))
+            mark = "  <- logged in" if (acct_dir.name, org_dir.name) == (acct, org) else ""
+            say(f"  {acct_dir.name}/{org_dir.name}: {n} card(s){mark}", "white")
+    if not found:
+        say("  (no account folders yet)", "gray")
+    if acct and org:
+        say(f"Logged-in account (from {source}): {acct} / {org}", "cyan")
+    if problem:
+        say(problem, "yellow")
+    return 0
+
+
+SYNC_FIELDS = ("lastActivityAt", "title", "titleSource")
+
+
+def sync_card(src_card, dst_path, dry_run):
+    """Bring a card's last-activity time and title up to date from a newer copy in another account."""
+    dst = load_json(dst_path)
+    if not isinstance(dst, dict):
+        return False
+    if (src_card.get("lastActivityAt") or 0) <= (dst.get("lastActivityAt") or 0):
+        return False
+    changed = False
+    for k in SYNC_FIELDS:
+        if k in src_card and src_card[k] != dst.get(k):
+            dst[k] = src_card[k]
+            changed = True
+    if changed and not dry_run:
+        with open(dst_path, "w", encoding="utf-8") as fh:
+            json.dump(dst, fh, ensure_ascii=False, separators=(",", ":"))
+    return changed
+
+
+def restart_remote_helpers(hosts, dry_run):
+    """Claude Desktop starts a helper server on each SSH host with the credentials of the account that
+    started it. Stopping it makes Claude Desktop start a fresh one with the current account."""
+    if not hosts:
+        return
+    remote_cmd = 'pkill -u "$(id -un)" -f "$HOME/.claude/remote/(srv|ccd-cli)/" ; true'
+    for host in hosts:
+        if dry_run:
+            say(f"Would restart Claude Desktop's helpers on {host}.", "yellow")
+            continue
+        try:
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote_cmd],
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                say(f"Restarted Claude Desktop's helpers on {host}.", "green")
+            else:
+                say(f"Could not reach {host} ({(r.stderr or '').strip() or 'ssh failed'}). "
+                    f"On that host run: pkill -u \"$USER\" -f \"$HOME/.claude/remote/(srv|ccd-cli)/\"", "yellow")
+        except Exception as e:
+            say(f"Could not reach {host}: {e}", "yellow")
+
+
+def cmd_desktop(args):
+    cards_root = Path(args.cards_dir).expanduser() if args.cards_dir else DEFAULT_CARDS
+    projects_root = Path(args.projects_dir).expanduser() if args.projects_dir else DEFAULT_PROJECTS
+    if not IS_MAC:
+        say("Note: `desktop` is meant for Claude Desktop on macOS.", "yellow")
+    if args.list:
+        return desktop_list(cards_root)
+
+    if args.quit:
+        if not quit_desktop():
+            say("Claude Desktop did not quit in time. Quit it with Cmd+Q and run again.", "yellow")
+            return 1
+    elif not args.ignore_running and not args.dest_root and not args.dry_run:
+        pids = desktop_running()
+        if pids:
+            say(f"Claude Desktop is still running (PID {', '.join(pids)}).", "yellow")
+            say("Quit it completely with Cmd+Q and run again, or pass --quit to do it for you.", "yellow")
+            return 1
+
+    if args.dest_root:
+        dest = Path(args.dest_root).expanduser()
+        acct = None
+    else:
+        if args.account and args.org:
+            acct, org = args.account, args.org
+        elif args.account or args.org:
+            say("--account and --org must be used together.", "yellow")
+            return 2
+        else:
+            acct, org, source, problem = read_current_account(cards_root)
+            if not (acct and org):
+                say(problem, "yellow")
+                say("You can also pass --account and --org (see --list).", "yellow")
+                return 1
+        dest = cards_root / acct / org
+        say(f"Logged-in account : {acct}", "cyan")
+        say(f"Organization      : {org}", "cyan")
+        if not (args.account and args.org):
+            say(f"Detected from     : {source}", "gray")
+    say(f"Target folder     : {dest}", "cyan")
+
+    if not cards_root.exists() and not args.dest_root:
+        say(f"Warning: {cards_root} does not exist yet. If Claude Desktop stores cards elsewhere, "
+            "run with --list or --cards-dir.", "yellow")
+
+    if args.dry_run:
+        say("Dry run: nothing will be written.", "yellow")
+    else:
+        dest.mkdir(parents=True, exist_ok=True)
+
+    if not args.no_backup and not args.dry_run and cards_root.exists():
+        bk = make_backup(cards_root)
+        say(f"Backup            : {bk}", "green")
+
+    all_cards = iter_cards(cards_root)
+    tmpl = load_json(min(all_cards, key=lambda p: p.stat().st_size)) if all_cards else None
+    tmpl = tmpl if isinstance(tmpl, dict) else {}
+    def_model = tmpl.get("model") or "claude-opus-4-8"
+    def_effort = tmpl.get("effort") or "high"
+    def_chrome = tmpl.get("chromePermissionMode") or "default"
+    def_mcp = tmpl.get("remoteMcpServersConfig") if tmpl else None
+
+    have = {}
+    if dest.exists():
+        for f in dest.glob("local_*.json"):
+            o = load_json(f)
+            if isinstance(o, dict) and o.get("cliSessionId"):
+                have[str(o["cliSessionId"]).lower()] = f
+
+    copied = synced = 0
+    for f in sorted(all_cards, key=lambda p: -((load_json(p) or {}).get("lastActivityAt") or 0)):
+        if same_dir(f.parent, dest):
+            continue
+        o = load_json(f)
+        if not isinstance(o, dict) or not o.get("cliSessionId"):
+            continue
+        key = str(o["cliSessionId"]).lower()
+        if key in have:
+            if have[key] is not None and sync_card(o, have[key], args.dry_run):
+                synced += 1
+            continue
+        target = dest / f.name
+        if not args.dry_run:
+            if target.exists():
+                target = dest / f"local_{uuid.uuid4()}.json"
+            shutil.copy2(f, target)
+        have[key] = target if not args.dry_run else None
+        copied += 1
+    say(f"{'Would copy' if args.dry_run else 'Copied'} {copied} card(s) from other accounts"
+        f"{f'; updated {synced} with newer activity' if synced else ''}.", "green")
+
+    if args.existing_cards_only:
+        say("--existing-cards-only: CLI / VS Code sessions skipped.", "yellow")
+    elif not projects_root.exists():
+        say(f"Warning: {projects_root} does not exist; no transcripts to scan.", "yellow")
+    else:
+        generated = skipped = 0
+        for t in projects_root.rglob("*.jsonl"):
+            if not t.is_file() or t.parent.name == "subagents":
+                continue
+            cli = t.stem
+            key = cli.lower()
+            if key in have:
+                skipped += 1
+                continue
+            cwd, created_iso, title = get_meta(t)
+            cwd = cwd or ""
+            st = t.stat()
+            birth = getattr(st, "st_birthtime", st.st_mtime)
+            created = to_epoch_ms(created_iso, birth)
+            last = int(st.st_mtime * 1000)
+            if not title:
+                leaf = os.path.basename(cwd.rstrip("/")) if cwd else "session"
+                title = f"{leaf} (recovered)"
+            g = str(uuid.uuid4())
+            rec = {
+                "sessionId": f"local_{g}", "cliSessionId": cli, "cwd": cwd, "originCwd": cwd,
+                "lastFocusedAt": last, "createdAt": created, "lastActivityAt": last,
+                "model": def_model, "effort": def_effort, "isArchived": False,
+                "title": title, "titleSource": "auto", "permissionMode": "auto",
+                "remoteMcpServersConfig": def_mcp, "chromePermissionMode": def_chrome,
+                "completedTurns": 1, "alwaysAllowedReasons": None,
+                "sessionPermissionUpdates": None, "classifierSummaryEnabled": True,
+            }
+            if not args.dry_run:
+                with open(dest / f"local_{g}.json", "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh, ensure_ascii=False, separators=(",", ":"))
+            have[key] = None
+            generated += 1
+        verb = "Would create" if args.dry_run else "Created"
+        say(f"{verb} {generated} new card(s); {skipped} already present.", "green")
+
+    hosts = [] if args.no_remotes else (args.remote or load_config().get("remotes") or [])
+    if not args.dest_root:
+        restart_remote_helpers(hosts, args.dry_run)
+
+    if acct:
+        cli = read_cli_account()
+        if cli and cli[0] != acct:
+            who = cli[2] or cli[0]
+            say(f"Note: the `claude` command in your terminal is signed in as {who}, not the account Claude "
+                f"Desktop uses. Use `{PROG} run` (or /login in claude) for terminal sessions.", "yellow")
+
+    if args.dry_run:
+        say("Dry run finished.", "white")
+    else:
+        total = len(list(dest.glob("local_*.json")))
+        say(f"Done. This account's Code tab now has {total} session card(s).", "white")
+        if args.reopen:
+            open_desktop()
+        else:
+            say("Open Claude Desktop -> Code tab: your sessions should be listed.", "cyan")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# `claude-relay remote`
+# ---------------------------------------------------------------------------
+def cmd_remote(args):
+    with Locked():
+        cfg = load_config()
+        hosts = list(cfg.get("remotes") or [])
+        if args.action == "add":
+            if args.host not in hosts:
+                hosts.append(args.host)
+        elif args.action == "remove":
+            hosts = [h for h in hosts if h != args.host]
+        cfg["remotes"] = hosts
+        if args.action in ("add", "remove"):
+            save_config(cfg)
+    if hosts:
+        say("SSH hosts restarted by `claude-relay desktop`:", "cyan")
+        for h in hosts:
+            say(f"  {h}", "white")
+    else:
+        say(f"No SSH hosts. Add one with: {PROG} remote add <ssh-host>", "yellow")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog=PROG,
+        description="Use several Claude subscriptions as one: automatic account failover for Claude Code "
+                    "in the terminal, and session migration for Claude Desktop.",
+        epilog=f"Start with: {PROG} accounts add <name>   then   {PROG} run",
+    )
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = ap.add_subparsers(dest="command", metavar="<command>")
+
+    sub.add_parser("run", help="start Claude Code with automatic account failover (claude args follow)",
+                   add_help=False)
+
+    acc = sub.add_parser("accounts", help="add, list or remove accounts")
+    accsub = acc.add_subparsers(dest="action", metavar="<action>")
+    a_add = accsub.add_parser("add", help="store the token for an account")
+    a_add.add_argument("name")
+    a_add.add_argument("--token-file", metavar="PATH", help="read the token from a file instead of a prompt")
+    a_add.add_argument("--store", choices=["keychain", "file"], help="where to keep the token")
+    accsub.add_parser("list", help="show accounts, usage and availability")
+    a_rm = accsub.add_parser("remove", help="forget an account and delete its token")
+    a_rm.add_argument("name")
+
+    sub.add_parser("status", help="same as `accounts list`")
+    use = sub.add_parser("use", help="make an account the first choice")
+    use.add_argument("name")
+    reset = sub.add_parser("reset", help="forget recorded usage so accounts are tried again")
+    reset.add_argument("name", nargs="?")
+
+    conf = sub.add_parser("config", help="show or change settings")
+    conf.add_argument("key", nargs="?")
+    conf.add_argument("value", nargs="?")
+
+    rem = sub.add_parser("remote", help="SSH hosts whose Claude Desktop helpers `desktop` restarts")
+    rem.add_argument("action", choices=["add", "remove", "list"])
+    rem.add_argument("host", nargs="?")
+
+    d = sub.add_parser("desktop", help="move Code-tab sessions to the account Claude Desktop is signed into")
+    d.add_argument("--list", action="store_true", help="show account folders and card counts; changes nothing")
+    d.add_argument("--dry-run", action="store_true", help="show what would change without writing anything")
+    d.add_argument("--existing-cards-only", action="store_true",
+                   help="only move sessions created in the Desktop Code tab (skip CLI / VS Code sessions)")
+    d.add_argument("--quit", action="store_true", help="quit Claude Desktop first")
+    d.add_argument("--reopen", action="store_true", help="reopen Claude Desktop when done")
+    d.add_argument("--remote", action="append", metavar="HOST",
+                   help="SSH host whose Claude Desktop helpers to restart (default: `remote` list)")
+    d.add_argument("--no-remotes", action="store_true", help="do not restart helpers on SSH hosts")
+    d.add_argument("--account", metavar="UUID", help="target account id (use with --org)")
+    d.add_argument("--org", metavar="UUID", help="target organization id (use with --account)")
+    d.add_argument("--cards-dir", metavar="PATH", help=f"card folder (default: {DEFAULT_CARDS})")
+    d.add_argument("--projects-dir", metavar="PATH", help=f"transcripts folder (default: {DEFAULT_PROJECTS})")
+    d.add_argument("--dest-root", metavar="PATH", help="write cards to this folder instead (testing)")
+    d.add_argument("--ignore-running", action="store_true", help="do not stop if Claude Desktop is running")
+    d.add_argument("--no-backup", action="store_true", help="skip the backup (testing only)")
+    return ap
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "run":
+        return cmd_run(argv[1:])
+    if argv and argv[0] == "_statusline":
+        return internal_statusline()
+    if argv and argv[0] == "_hook" and len(argv) > 1:
+        return internal_hook(argv[1])
+
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if args.command is None:
+        ap.print_help()
+        return 0
+    if args.command == "accounts":
+        if args.action == "add":
+            return cmd_accounts_add(args)
+        if args.action == "remove":
+            return cmd_accounts_remove(args)
+        return cmd_accounts_list(args)
+    if args.command == "status":
+        return cmd_accounts_list(args)
+    if args.command == "use":
+        return cmd_use(args)
+    if args.command == "reset":
+        return cmd_reset(args)
+    if args.command == "config":
+        return cmd_config(args)
+    if args.command == "remote":
+        if args.action in ("add", "remove") and not args.host:
+            die(f"Usage: {PROG} remote {args.action} <ssh-host>")
+        return cmd_remote(args)
+    if args.command == "desktop":
+        say(f"== {PROG} {__version__} · desktop ==", "white")
+        return cmd_desktop(args)
+    ap.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    if sys.version_info < (3, 8):
+        sys.stderr.write(f"{PROG} needs Python 3.8 or newer.\n")
+        sys.exit(1)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

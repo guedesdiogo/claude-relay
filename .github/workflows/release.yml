@@ -1,7 +1,7 @@
 name: Release
 
 # Releases happen automatically when the version in package.json changes on main:
-#   1. bump "version" in package.json and __version__ in bin/claude-session-restorer
+#   1. bump "version" in package.json and __version__ in bin/claude-relay
 #   2. update CHANGELOG.md
 #   3. push to main
 # This workflow then, only if tag v<version> does not exist yet:
@@ -38,7 +38,7 @@ jobs:
         name: Is this version already released?
         run: |
           PKG=$(node -p "require('./package.json').version")
-          CLI=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' bin/claude-session-restorer)
+          CLI=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' bin/claude-relay)
           if [ "$PKG" != "$CLI" ]; then
             echo "::error::package.json ($PKG) and __version__ ($CLI) differ"; exit 1
           fi
@@ -113,26 +113,26 @@ jobs:
           URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/v${VERSION}.tar.gz"
           SHA=$(curl -fsSL "$URL" | sha256sum | cut -d' ' -f1)
           sed -e "s/__VERSION__/${VERSION}/g" -e "s/__SHA256__/${SHA}/g" \
-            packaging/homebrew/claude-session-restorer.rb.tmpl > claude-session-restorer.rb
+            packaging/homebrew/claude-relay.rb.tmpl > claude-relay.rb
           echo "sha256: $SHA"
-          cat claude-session-restorer.rb
+          cat claude-relay.rb
       - name: Keep the formula as a build artifact
         uses: actions/upload-artifact@v4
         with:
           name: homebrew-formula
-          path: claude-session-restorer.rb
+          path: claude-relay.rb
       - name: Push to the tap
         if: env.TAP_TOKEN != ''
         run: |
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/guedesdiogo/homebrew-tap.git" tap
           mkdir -p tap/Formula
-          cp claude-session-restorer.rb tap/Formula/claude-session-restorer.rb
+          cp claude-relay.rb tap/Formula/claude-relay.rb
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/claude-session-restorer.rb
+          git add Formula/claude-relay.rb
           git diff --cached --quiet && { echo "Formula already up to date"; exit 0; }
-          git commit -m "claude-session-restorer ${VERSION}"
+          git commit -m "claude-relay ${VERSION}"
           git push
       - name: Note when the tap was not updated
         if: env.TAP_TOKEN == ''

@@ -1,35 +1,42 @@
-# claude-session-restorer
+# claude-relay
 
-[![CI](https://github.com/guedesdiogo/claude-session-restorer/actions/workflows/ci.yml/badge.svg)](https://github.com/guedesdiogo/claude-session-restorer/actions/workflows/ci.yml)
-![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
+[![CI](https://github.com/guedesdiogo/claude-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/guedesdiogo/claude-relay/actions/workflows/ci.yml)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**Switch between Claude accounts on your Mac without losing your Claude Code sessions.**
+**Use several Claude subscriptions as one, without losing your sessions.**
 
-When you log into a different Claude account in Claude Desktop, the **Code** tab shows an empty
-session list. Your conversations are not gone — the app just keeps a separate session list per
-account. `claude-session-restorer` rebuilds that list for whichever account you are logged into,
-so you can pick up any session exactly where you left off. Switch back, run it again, and you are
-back where you were. Repeat as often as you like.
+- **In the terminal**, `claude-relay run` starts Claude Code with one of your accounts. When that
+  account gets close to its usage limit, or hits it, claude-relay switches to the next account and
+  resumes the **same session** on its own: you keep working where you were.
+- **In Claude Desktop**, `claude-relay desktop` brings your Code-tab sessions along when you switch
+  accounts, and restarts Claude Desktop's helpers on your SSH servers so remote sessions use the
+  new account too.
 
-> This is a macOS port of
-> [sahol3/claude-code-session-restorer](https://github.com/sahol3/claude-code-session-restorer)
-> (Windows / PowerShell). It is an unofficial community tool, not affiliated with or endorsed by
-> Anthropic.
+Everything stays in one conversation history: sessions are files on disk that belong to no
+account, so you can go from account A to B and back as often as you like.
+
+> Unofficial community tool, not affiliated with or endorsed by Anthropic.
+> Anthropic staff have said publicly that holding several Max subscriptions is not against the
+> terms, and there are also reports of multi-account users being flagged by automated abuse
+> systems. Make sure your use fits Anthropic's terms and the rules of whoever pays for each
+> subscription.
 
 ---
 
 ## Contents
 
 - [Install](#install)
-- [Quick start](#quick-start)
-- [Switching between two accounts, as often as you need](#switching-between-two-accounts-as-often-as-you-need)
-- [Options](#options)
+- [Terminal: automatic account failover](#terminal-automatic-account-failover)
+- [Claude Desktop: switching accounts](#claude-desktop-switching-accounts)
+- [SSH servers](#ssh-servers)
+- [Commands](#commands)
+- [Settings](#settings)
 - [How it works](#how-it-works)
-- [Safety, backups and undo](#safety-backups-and-undo)
+- [Security](#security)
 - [Troubleshooting](#troubleshooting)
-- [Resuming from the terminal instead](#resuming-from-the-terminal-instead)
+- [Upgrading from claude-session-restorer](#upgrading-from-claude-session-restorer)
 - [Development](#development)
 - [Credits and license](#credits-and-license)
 
@@ -37,268 +44,315 @@ back where you were. Repeat as often as you like.
 
 ## Install
 
-Requirements: **macOS** and **Python 3.8+**. If you use Homebrew you already have Python, because
-Homebrew requires Apple's Command Line Tools, which include `python3`. Check with
-`python3 --version`; if it is missing, run `xcode-select --install`.
+Requirements: **Python 3.8+** and [Claude Code](https://code.claude.com). The `desktop` command
+is for Claude Desktop on **macOS**; everything else also works on **Linux**.
 
-### Option 1 — Homebrew (recommended)
-
-```bash
-brew install guedesdiogo/tap/claude-session-restorer
-```
-
-Update later with `brew upgrade claude-session-restorer`.
-
-### Option 2 — npm from GitHub Packages
-
-GitHub Packages requires a GitHub token to install **any** npm package, even public ones. One-time
-setup:
-
-1. Create a **classic** personal access token at
-   <https://github.com/settings/tokens/new> with only the **`read:packages`** scope.
-2. Tell npm where to find the `@guedesdiogo` scope and how to authenticate:
-
-   ```bash
-   echo "@guedesdiogo:registry=https://npm.pkg.github.com" >> ~/.npmrc
-   echo "//npm.pkg.github.com/:_authToken=YOUR_TOKEN_HERE" >> ~/.npmrc
-   ```
-
-3. Install:
-
-   ```bash
-   npm install -g @guedesdiogo/claude-session-restorer
-   ```
-
-The npm package is a thin wrapper around the same Python script, so Python 3 is still required.
-
-### Option 3 — just the script
+### Homebrew (macOS, recommended)
 
 ```bash
-curl -fsSLo /usr/local/bin/claude-session-restorer \
-  https://raw.githubusercontent.com/guedesdiogo/claude-session-restorer/main/bin/claude-session-restorer
-chmod +x /usr/local/bin/claude-session-restorer
+brew install guedesdiogo/tap/claude-relay
 ```
 
-(Use `sudo` if `/usr/local/bin` is not writable, or pick any folder on your `PATH`.)
-
-Check the install:
+### Script (Linux servers, or any machine without Homebrew)
 
 ```bash
-claude-session-restorer --version
+curl -fsSL https://raw.githubusercontent.com/guedesdiogo/claude-relay/main/install.sh | sh
 ```
+
+It installs into `~/.local/bin` (change with `CLAUDE_RELAY_BIN_DIR`).
+
+### npm from GitHub Packages
+
+GitHub Packages asks for a GitHub token even for public packages. Create a classic token with only
+the `read:packages` scope at <https://github.com/settings/tokens/new>, then:
+
+```bash
+echo "@guedesdiogo:registry=https://npm.pkg.github.com" >> ~/.npmrc
+echo "//npm.pkg.github.com/:_authToken=YOUR_GITHUB_TOKEN" >> ~/.npmrc
+npm install -g @guedesdiogo/claude-relay
+```
+
+Check with `claude-relay --version`.
 
 ---
 
-## Quick start
+## Terminal: automatic account failover
 
-1. In **Claude Desktop**, sign out and sign in with the account you want to use. Open the **Code**
-   tab once (it will look empty — that is expected).
+### 1. Add your accounts (once)
+
+For **each** subscription, create a long-lived token. Run this in a terminal on a computer with a
+browser, and sign in to that account when the browser opens:
+
+```bash
+claude setup-token
+```
+
+It prints a token that starts with `sk-ant-oat01-` and is valid for one year. Store it:
+
+```bash
+claude-relay accounts add work      # paste the token when asked; it is not shown
+claude-relay accounts add personal
+claude-relay accounts list
+```
+
+On macOS tokens go into the **Keychain**; on Linux into `~/.config/claude-relay/tokens/` with
+permissions `600`. The first account you add is the one used first.
+
+### 2. Start Claude through claude-relay
+
+```bash
+claude-relay run                     # same as `claude`
+claude-relay run --model opus "fix the failing test"
+claude-relay run -c                  # any claude option works
+```
+
+To use it every time, add an alias to `~/.zshrc` or `~/.bashrc`:
+
+```bash
+alias claude='claude-relay run'
+```
+
+The status line shows which account is in use and how much of it you have used:
+
+```
+⇄ work · 5h 42% · 7d 81%
+```
+
+If you already have a status line of your own, it is kept and this line is added under it.
+
+### 3. What happens near the limit
+
+| Situation | What claude-relay does |
+| --------- | ---------------------- |
+| The account reaches the **threshold** (95% of the 5-hour or weekly window by default) | Waits for the current reply to finish, then restarts Claude on the next account and resumes the same session. Nothing is interrupted. |
+| The account **hits its limit** in the middle of a reply | Restarts on the next account, resumes the session and sends *"Continue exactly where you left off."* |
+| An account's **token is rejected** (expired or revoked) | Same as above, and skips that account for a day. Fix it with `claude-relay accounts add <name>` again. |
+| A **temporary** "capacity" error (429) | Nothing: that is not your account's limit. Claude retries as usual. |
+| **No other account** is available | Leaves Claude running and shows *no other account available* in the status line. |
+
+Accounts that reached the threshold or the limit are skipped until their window resets.
+`claude-relay accounts list` shows when each one is available again.
+
+Set the threshold with `claude-relay config threshold 90`. **`100` means "only switch when the
+limit is actually hit"**.
+
+Non-interactive runs work too: `claude-relay run -p "…"` continues on the next account with
+`--resume` if the run stops on a usage limit.
+
+---
+
+## Claude Desktop: switching accounts
+
+Claude Desktop keeps a separate session list per account, and its SSH helpers keep using the
+account that started them. claude-relay cannot sign Claude Desktop in for you (there is no
+supported way to do that), but it handles everything else.
+
+**Every time you switch, in either direction:**
+
+1. In Claude Desktop, sign out, sign in with the other account and open the **Code** tab once.
 2. Run:
 
    ```bash
-   claude-session-restorer --quit --reopen
+   claude-relay desktop --existing-cards-only --quit --reopen
    ```
 
-   This quits Claude Desktop, restores the session list for the logged-in account and opens the
-   app again.
-3. Go to the **Code** tab. Your sessions are listed; click one and continue.
+It quits Claude Desktop, copies the session list from your other accounts into this one (and
+updates sessions you continued elsewhere), restarts Claude Desktop's helpers on the SSH hosts you
+configured, and opens the app again. Your sessions are there; continue any of them.
 
-Prefer to do it by hand? Quit Claude with **Cmd+Q** (closing the window is not enough), run
-`claude-session-restorer`, then open Claude again.
-
----
-
-## Switching between two accounts, as often as you need
-
-The routine is the same in both directions:
-
-| Step | Account A → Account B | Account B → Account A |
-| ---- | --------------------- | --------------------- |
-| 1 | Sign out of A, sign in with B, open the Code tab | Sign out of B, sign in with A, open the Code tab |
-| 2 | `claude-session-restorer --quit --reopen` | `claude-session-restorer --quit --reopen` |
-| 3 | Continue any session in B | Continue any session in A, including the progress you made in B |
-
-Why it works in both directions:
-
-- Every session is stored once on disk as a transcript that belongs to no account. When you
-  continue a session in account B, the new messages go into that same transcript.
-- When you go back to A, A's entry for the session still points at that transcript, so you see
-  everything you did in B.
-- Sessions you started in B are copied into A on the next run.
-- Running the tool again never creates duplicates.
-
-Things to avoid:
-
-- **Do not use the same session from two accounts at the same time** (for example one in Claude
-  Desktop and one in the terminal). Both would write to the same transcript.
-- **Let Claude finish its current reply before switching**, so the transcript is not left
-  mid-write.
-
-Optional shell shortcut (add to `~/.zshrc`):
+Useful shortcut:
 
 ```bash
-alias claude-switch='claude-session-restorer --quit --reopen'
+alias claude-switch='claude-relay desktop --existing-cards-only --quit --reopen'
 ```
+
+Leave out `--existing-cards-only` if you also want sessions you started from the `claude` CLI or
+VS Code to appear in the app. Run `claude-relay desktop --dry-run` first to see how many that is.
+
+**What stays per account:** usage limits, scheduled tasks, claude.ai connectors and cloud sessions
+(Claude Code on the web). Archived status is per account too.
 
 ---
 
-## Options
+## SSH servers
+
+There are two separate things, depending on how you use the server.
+
+**You open Claude Code in a terminal on the server** (over SSH): install claude-relay **on the
+server** with the script above, add your accounts there, and use `claude-relay run` as on your
+Mac. Tokens are created on a computer with a browser (`claude setup-token`) and pasted into
+`claude-relay accounts add` on the server.
+
+**Claude Desktop runs sessions on the server** (sessions whose folder is on the server): Claude
+Desktop starts a helper there with the credentials of the account that started it. Tell
+claude-relay about the host once, on your Mac:
+
+```bash
+claude-relay remote add my-server    # a host name that works with plain `ssh my-server`
+```
+
+From then on, `claude-relay desktop` stops those helpers on each switch (Claude Desktop starts new
+ones with the current account). It needs key-based SSH login (no password prompt). Running
+sessions on that host are interrupted, so let replies finish before switching.
+
+---
+
+## Commands
+
+| Command | What it does |
+| ------- | ------------ |
+| `claude-relay run [claude options]` | Start Claude Code with automatic failover. |
+| `claude-relay accounts add NAME` | Store the token for an account (`--token-file PATH` to read it from a file). |
+| `claude-relay accounts list` / `status` | Accounts, recorded usage and availability. `*` marks the first choice. |
+| `claude-relay accounts remove NAME` | Forget an account and delete its token. |
+| `claude-relay use NAME` | Make an account the first choice. |
+| `claude-relay reset [NAME]` | Forget recorded usage, so skipped accounts are tried again. |
+| `claude-relay config [KEY [VALUE]]` | Show or change settings. |
+| `claude-relay remote add/remove/list HOST` | SSH hosts whose Claude Desktop helpers `desktop` restarts. |
+| `claude-relay desktop [options]` | Move Code-tab sessions to the account Claude Desktop is signed into. |
+
+`claude-relay desktop` options:
 
 | Option | What it does |
 | ------ | ------------ |
-| `--list` | Show every account folder, how many sessions it has and which one is logged in. Changes nothing. |
-| `--dry-run` | Show what would be copied or created, without writing anything. |
-| `--quit` | Quit Claude Desktop before restoring (waits until it has fully exited). |
-| `--reopen` | Open Claude Desktop again when finished. |
-| `--existing-cards-only` | Only move sessions that were created in the Desktop Code tab. Skips sessions started from the `claude` CLI or VS Code, to keep the list short. |
-| `--account UUID --org UUID` | Restore into this account instead of the detected one. |
-| `--cards-dir PATH` | Use a different Claude Desktop card folder. |
-| `--projects-dir PATH` | Use a different Claude Code transcripts folder. |
-| `--dest-root PATH` | Write cards to a scratch folder instead of the live one (testing). |
-| `--ignore-running` | Do not stop if Claude Desktop seems to be running. Not recommended. |
-| `--no-backup` | Skip the backup. Testing only. |
-| `--version` | Print the version. |
+| `--list` | Account folders, how many sessions each has, which one is signed in. Changes nothing. |
+| `--dry-run` | Show what would change without writing anything. |
+| `--existing-cards-only` | Only sessions created in the Desktop Code tab (skip CLI / VS Code sessions). |
+| `--quit` / `--reopen` | Quit Claude Desktop first / open it again when done. |
+| `--remote HOST` / `--no-remotes` | Restart helpers on this host instead of the configured list / on none. |
+| `--account UUID --org UUID` | Target this account instead of the detected one. |
+| `--cards-dir`, `--projects-dir`, `--dest-root` | Other folders (testing or unusual setups). |
+| `--ignore-running`, `--no-backup` | Testing only. |
+
+---
+
+## Settings
+
+`claude-relay config` shows them; `claude-relay config KEY VALUE` changes one.
+
+| Key | Default | Meaning |
+| --- | ------- | ------- |
+| `threshold` | `95` | Switch when the 5-hour or weekly window reaches this %. `100` = only when the limit is hit. |
+| `continue_prompt` | `Continue exactly where you left off.` | Sent after a switch that interrupted a reply. |
+| `cooldown_minutes` | `30` | How long to skip an account that hit its limit when its reset time is unknown. |
+| `claude_bin` | `claude` | The Claude Code command to start. |
+| `notify` | `true` | macOS notification when an account switch happens. |
+
+Files live in `~/.config/claude-relay/` (or `$XDG_CONFIG_HOME/claude-relay`, or
+`$CLAUDE_RELAY_HOME`).
 
 ---
 
 ## How it works
 
-Claude Code stores each conversation as a transcript:
+**Terminal failover** uses documented Claude Code features only:
 
-```
-~/.claude/projects/<encoded-project-folder>/<sessionId>.jsonl
-```
+- Each account's token is passed to Claude Code in `CLAUDE_CODE_OAUTH_TOKEN`, which takes priority
+  over the `/login` credentials. `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are removed for that
+  process, because they would take priority over the token.
+- claude-relay adds, for that session only (`--settings`, nothing is written to your settings
+  files), a status line that records `rate_limits` (5-hour and weekly usage and reset times) and
+  three hooks: `SessionStart` (session id), `Stop` (end of a reply) and `StopFailure` (a reply
+  failed on `rate_limit`, `billing_error` or `authentication_failed`).
+- When a switch is needed, claude-relay stops Claude, starts it again with the next account and
+  `--resume <session id>`, keeping your other options. Conversations are files under
+  `~/.claude/projects` that belong to no account, so the history is intact.
+- In `-p` mode Claude can exit before a hook finishes, so claude-relay also reads the failure from
+  the session transcript.
 
-Transcripts are keyed by project folder and contain **no account information**, so switching
-accounts never touches them.
+**Claude Desktop** does not list transcripts directly. It keeps a small "card" per session, per
+account, in
+`~/Library/Application Support/Claude/claude-code-sessions/<accountId>/<orgId>/local_*.json`, each
+pointing at a transcript through `cliSessionId`. `claude-relay desktop` reads the signed-in
+account from Claude Desktop's own config (`lastKnownAccountUuid`; Claude Desktop does not update
+`~/.claude.json`), backs up the card folder, copies cards from other accounts, updates cards whose
+copy elsewhere has newer activity, and optionally creates cards for CLI / VS Code transcripts.
+Remote helpers live in `~/.claude/remote/` on each SSH host.
 
-The Claude Desktop **Code** tab does not read transcripts directly. It reads one small "card" per
-session, stored **per account**:
-
-```
-~/Library/Application Support/Claude/claude-code-sessions/<accountId>/<organizationId>/local_*.json
-```
-
-Each card points at its transcript through a `cliSessionId` field. Cards have no account field;
-they belong to an account only because of the folder they sit in. That is why sessions from
-another account, and sessions started from the CLI or VS Code, do not show up.
-
-On each run, the tool:
-
-1. Finds the account Claude Desktop is signed into, from `lastKnownAccountUuid` in the app's
-   `config.json` (or `claude_desktop_config.json`), and the organization from that account's card
-   folder. Claude Desktop does **not** update `~/.claude.json` when you switch accounts in the app,
-   so that file (the `claude` CLI login) is only used as a fallback.
-2. Backs up the whole `claude-code-sessions` folder.
-3. Copies any card from another account folder whose transcript is not already listed for the
-   current account.
-4. Creates a card for every transcript that still has none, using the session title Claude
-   generated (`aiTitle`), a summary, or the first user message, in that order.
+The Claude Desktop file format was worked out by observation and may change in any app update.
 
 ---
 
-## Safety, backups and undo
+## Security
 
-- **Backups:** before writing, the whole card folder is copied to
-  `~/Library/Application Support/Claude/claude-code-sessions_backup_<date>_<time>`.
-- **Add-only:** cards are only added. Transcripts are never modified or deleted.
-- **Idempotent:** running it again skips everything already present.
-- **Undo:** quit Claude, delete `claude-code-sessions`, rename the backup you want back to
-  `claude-code-sessions`, and open Claude.
+- Tokens are stored in the macOS Keychain (service `claude-relay`) or in files readable only by
+  you. claude-relay only ever hands them to the Claude Code process it starts, through its
+  environment.
+- `claude-relay accounts add` hides the token while you paste it, and on macOS the token is passed
+  to the Keychain through standard input, so it never shows up in the process list.
+- A token from `claude setup-token` can only make model requests and lasts one year. If one leaks,
+  revoke it from your Claude account settings and run `claude-relay accounts remove`.
+- `claude-relay desktop` backs up the whole card folder before writing and never modifies or
+  deletes transcripts. Undo: quit Claude Desktop, replace `claude-code-sessions` with the backup
+  folder `claude-code-sessions_backup_<date>_<time>`, reopen.
 
-Backups accumulate over time. Delete old ones when you no longer need them:
-
-```bash
-ls -d ~/Library/Application\ Support/Claude/claude-code-sessions_backup_*
-```
-
-### Keep transcripts for longer
-
-Claude Code deletes transcripts older than `cleanupPeriodDays` (30 days by default). To keep them
-longer, add this to `~/.claude/settings.json`:
+Claude Code deletes transcripts older than 30 days by default. To keep sessions longer, put this in
+`~/.claude/settings.json` on each machine:
 
 ```json
 { "cleanupPeriodDays": 3650 }
-```
-
-It is also worth keeping a copy of your transcripts:
-
-```bash
-cp -R ~/.claude/projects ~/claude-projects-backup-$(date +%Y%m%d)
 ```
 
 ---
 
 ## Troubleshooting
 
-**"Claude Desktop is still running"** — The app rewrites the card folder when it exits, so it has
-to be closed first. Use `--quit`, or quit with **Cmd+Q** (closing the window only hides it).
+**Claude still says the limit was reached after a Desktop switch** — Sessions that run on an SSH
+host use Claude Desktop's helper there. Add the host with `claude-relay remote add <host>` and run
+`claude-relay desktop` again, or on the host run
+`pkill -u "$USER" -f "$HOME/.claude/remote/(srv|ccd-cli)/"` with Claude Desktop closed.
+
+**"Claude Desktop is still running"** — The app rewrites its session list when it exits. Use
+`--quit`, or quit with **Cmd+Q** (closing the window only hides it).
 
 **"… has no session folder yet. Open the Code tab …"** — Claude Desktop creates the folder for an
-account the first time you open the Code tab with it. Open it once, then run again.
+account the first time you open the Code tab with it.
 
-**The detected account is wrong** — `--list` shows where the account was read from. Pass the right
-one explicitly with `--account` and `--org`, using the folder names `--list` prints, and please
-[open an issue](https://github.com/guedesdiogo/claude-session-restorer/issues) with your Claude
-Desktop version.
+**The plain `claude` command uses the wrong account** — Claude Desktop and the `claude` command
+have separate logins. Use `claude-relay run`, or `/login` inside `claude`.
+`claude-relay desktop` prints a note when they differ.
 
-**"… does not exist" for the card folder** — Claude Desktop may store cards somewhere else on your
-version. Look with `ls ~/Library/Application\ Support/Claude/` and pass the right folder with
-`--cards-dir`. Please [open an issue](https://github.com/guedesdiogo/claude-session-restorer/issues)
-so the default can be fixed.
+**An account is skipped although it has usage left** — `claude-relay accounts list` shows why and
+until when. `claude-relay reset NAME` makes claude-relay try it again.
 
-**Sessions still do not appear** — Run `claude-session-restorer --list` and check that the
-logged-in account folder has cards. A Claude Desktop update may have changed the file format;
-please open an issue with your Claude Desktop version.
-
-**Cloud sessions** — Sessions that ran in the cloud (Claude Code on the web or remote sessions)
-belong to the account that created them and cannot be moved by this tool.
+**No usage shown for an account** — Usage comes from Claude Code's status line, which only
+receives it for Pro and Max subscriptions and only after the first reply.
 
 ---
 
-## Resuming from the terminal instead
+## Upgrading from claude-session-restorer
 
-You do not need this tool if you are happy to resume from the command line. From the project
-folder:
-
-```bash
-claude --continue          # most recent session in this folder
-claude --resume            # choose from a list
-claude --resume <sessionId>
-```
-
-The list is scoped to the current folder, not to the account.
+This project used to be called `claude-session-restorer`. `brew upgrade` moves you to
+`claude-relay` automatically, and the old command keeps working: `claude-session-restorer [options]`
+runs `claude-relay desktop [options]`. Old links to the repository redirect here.
 
 ---
 
 ## Development
 
 ```bash
-git clone https://github.com/guedesdiogo/claude-session-restorer.git
-cd claude-session-restorer
+git clone https://github.com/guedesdiogo/claude-relay.git
+cd claude-relay
 python3 -m unittest discover -s tests -v
 ```
 
-The tests run the real CLI against a temporary fake home folder; they never touch your real
-Claude data.
+The tests run the real CLI against a temporary home folder and a fake `claude`
+(`tests/fake_claude.py`) that calls the status line and hooks the way Claude Code does. They never
+touch your real Claude data.
 
-**Releasing:** bump the version in `package.json` and in `__version__` inside
-`bin/claude-session-restorer`, add a `## 1.2.3` section to `CHANGELOG.md`, and push to `main`.
-
-When the version on `main` has no matching tag yet, the
+**Releasing:** bump `version` in `package.json` and `__version__` in `bin/claude-relay`, add a
+`## x.y.z` section to `CHANGELOG.md`, and push to `main`. The
 [release workflow](.github/workflows/release.yml) runs the tests, creates the tag and the GitHub
-Release (notes taken from `CHANGELOG.md`),
-publishes the npm package to GitHub Packages and, if the `HOMEBREW_TAP_TOKEN` secret is set,
-updates the formula in [guedesdiogo/homebrew-tap](https://github.com/guedesdiogo/homebrew-tap).
-That secret is a fine-grained token with **Contents: read and write** on the tap repository.
+Release, publishes the npm package to GitHub Packages and renders the Homebrew formula. With a
+`HOMEBREW_TAP_TOKEN` secret (a fine-grained token with Contents read/write on
+`guedesdiogo/homebrew-tap`), it also updates the tap.
 
 ---
 
 ## Credits and license
 
-- Original Windows tool and research into the card format:
+- The Claude Desktop session list format and the original Windows tool:
   [sahol3/claude-code-session-restorer](https://github.com/sahol3/claude-code-session-restorer).
-- macOS port, packaging and extra options: [Diogo Guedes](https://github.com/guedesdiogo).
+- claude-relay: [Diogo Guedes](https://github.com/guedesdiogo).
 
-[MIT](LICENSE). The file format was worked out by observation and may change in any Claude Desktop
-update. The tool backs up before writing and only adds files, but you use it at your own risk.
+[MIT](LICENSE).

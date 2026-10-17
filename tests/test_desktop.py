@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "bin" / "claude-relay"
 SHIM = ROOT / "bin" / "claude-session-restorer"
 CARDS_REL = Path("Library") / "Application Support" / "Claude" / "claude-code-sessions"
+NOT_AN_ANCESTOR = 9999999  # above pid_max on macOS and Linux, so never a real process
 
 
 class FakeHome:
@@ -57,6 +58,21 @@ class FakeHome:
         script = self.bin / "ssh"
         script.write_text(f"#!/bin/sh\necho \"$@\" >> '{log}'\nexit 0\n")
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        return log
+
+    def fake_desktop(self, pid):
+        """Fake pgrep, osascript and open: Claude Desktop runs as `pid` until osascript asks it to quit."""
+        log = self.root / "desktop.log"
+        gone = self.root / "desktop-quit"
+        scripts = {
+            "pgrep": f"#!/bin/sh\necho \"pgrep $*\" >> '{log}'\n[ -e '{gone}' ] && exit 1\necho {pid}\n",
+            "osascript": f"#!/bin/sh\necho \"osascript $*\" >> '{log}'\ntouch '{gone}'\n",
+            "open": f"#!/bin/sh\necho \"open $*\" >> '{log}'\n",
+        }
+        for name, body in scripts.items():
+            script = self.bin / name
+            script.write_text(body)
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
         return log
 
     def env(self):
@@ -202,6 +218,38 @@ class DesktopTests(unittest.TestCase):
         self.assertIn(".claude/remote/(srv|ccd-cli)/", sent)
         r = self.h.run("--no-remotes")
         self.assertNotIn("devbox", r.stdout)
+
+    def test_running_check_sees_desktop_above_this_process(self):
+        # macOS pgrep leaves out its own ancestors unless given -a, so from a Code-tab shell
+        # (a descendant of Claude Desktop) a plain `pgrep -x Claude` never saw the app.
+        log = self.h.fake_desktop(NOT_AN_ANCESTOR)
+        self.h.login("acctB", "orgB")
+        r = self.h.relay("desktop")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn(f"Claude Desktop is still running (PID {NOT_AN_ANCESTOR})", r.stdout)
+        self.assertEqual(self.h.cards_of("acctB", "orgB"), [])
+        expected = "pgrep -a -x Claude" if sys.platform == "darwin" else "pgrep -x Claude"
+        self.assertIn(expected, log.read_text().splitlines())
+
+    def test_quit_from_a_terminal(self):
+        log = self.h.fake_desktop(NOT_AN_ANCESTOR)
+        self.h.login("acctB", "orgB")
+        r = self.h.relay("desktop", "--quit")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('osascript -e quit app "Claude"', log.read_text())
+        self.assertNotIn("inside Claude Desktop", r.stdout)
+        self.assertEqual(len(self.h.cards_of("acctB", "orgB")), 2)
+
+    def test_quit_from_inside_desktop_warns(self):
+        # The test runner stands in for Claude Desktop: it is an ancestor of the CLI it starts.
+        log = self.h.fake_desktop(os.getpid())
+        self.h.login("acctB", "orgB")
+        r = self.h.relay("desktop", "--quit")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"running inside Claude Desktop (PID {os.getpid()})", r.stdout)
+        self.assertIn("Run it from Terminal.app", r.stdout)
+        self.assertIn('osascript -e quit app "Claude"', log.read_text())
+        self.assertEqual(len(self.h.cards_of("acctB", "orgB")), 2)
 
     def test_compat_command(self):
         self.h.login("acctA", "orgA")

@@ -38,7 +38,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -965,16 +965,40 @@ def iter_cards(root):
 
 
 def desktop_running():
+    # macOS pgrep leaves out its own ancestors unless given -a, so from a shell that Claude Desktop
+    # started (a Code-tab session) it would not see the app. On Linux, -a lists command lines instead.
+    cmd = ["pgrep", "-a", "-x", APP_NAME] if IS_MAC else ["pgrep", "-x", APP_NAME]
     try:
-        r = subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True)
         return [pid for pid in r.stdout.split() if pid]
     except Exception:
         return []
 
 
+def desktop_ancestor(pids):
+    """The PID in `pids` that this process runs under, e.g. Claude Desktop for a Code-tab shell."""
+    try:
+        r = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True)
+    except Exception:
+        return None
+    parent = dict(line.split() for line in r.stdout.splitlines() if len(line.split()) == 2)
+    pid, seen = str(os.getpid()), set()
+    while pid in parent and pid not in seen:
+        seen.add(pid)
+        pid = parent[pid]
+        if pid in pids:
+            return pid
+    return None
+
+
 def quit_desktop(timeout=30):
-    if not desktop_running():
+    pids = desktop_running()
+    if not pids:
         return True
+    inside = desktop_ancestor(pids)
+    if inside:
+        say(f"Warning: this command is running inside Claude Desktop (PID {inside}). Quitting the app "
+            "will most likely stop it before it copies anything. Run it from Terminal.app instead.", "yellow")
     say("Quitting Claude Desktop...", "cyan")
     try:
         subprocess.run(["osascript", "-e", f'quit app "{APP_NAME}"'], capture_output=True, text=True, timeout=15)

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.1 — 2026-10-17
+
+- `claude-relay desktop` now sees Claude Desktop when it runs from a terminal the app started (a
+  Code-tab session). On macOS, `pgrep` leaves out its own ancestors unless given `-a`, so `--quit`
+  quit nothing and the "still running" check passed with the app open.
+- `--quit` warns when it runs inside Claude Desktop: quitting the app most likely stops the command
+  before it copies anything. Run it from Terminal.app.
+
 ## 2.0.0 — 2026-10-12
 
 The project is now **claude-relay**: it uses several Claude subscriptions as one.

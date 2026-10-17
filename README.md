@@ -150,7 +150,7 @@ supported way to do that), but it handles everything else.
 **Every time you switch, in either direction:**
 
 1. In Claude Desktop, sign out, sign in with the other account and open the **Code** tab once.
-2. Run:
+2. Run, in Terminal.app (not in a Code-tab session, which stops when the app quits):
 
    ```bash
    claude-relay desktop --existing-cards-only --quit --reopen

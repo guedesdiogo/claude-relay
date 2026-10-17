@@ -38,7 +38,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.0.2"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -964,17 +964,53 @@ def iter_cards(root):
     return [p for p in root.rglob("local_*.json") if p.is_file()]
 
 
+class DesktopCheckError(Exception):
+    """pgrep could not tell whether Claude Desktop is running."""
+
+
 def desktop_running():
+    """PIDs of Claude Desktop, [] when pgrep finds none. Raises DesktopCheckError when pgrep cannot tell."""
+    # macOS pgrep leaves out its own ancestors unless given -a, so from a shell that Claude Desktop
+    # started (a Code-tab session) it would not see the app. On Linux, -a lists command lines instead.
+    cmd = ["pgrep", "-a", "-x", APP_NAME] if IS_MAC else ["pgrep", "-x", APP_NAME]
     try:
-        r = subprocess.run(["pgrep", "-x", APP_NAME], capture_output=True, text=True)
-        return [pid for pid in r.stdout.split() if pid]
-    except Exception:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        raise DesktopCheckError(f"could not run pgrep: {e.strerror or e}") from e
+    if r.returncode == 0:
+        return r.stdout.split()
+    if r.returncode == 1:
         return []
+    # 2 is a syntax error and 3 a fatal error, on macOS and with Linux procps.
+    err = r.stderr.strip().splitlines()
+    raise DesktopCheckError(f"pgrep exited with code {r.returncode}" + (f": {err[0]}" if err else ""))
+
+
+def desktop_ancestor(pids):
+    """The PID in `pids` that this process runs under, e.g. Claude Desktop for a Code-tab shell."""
+    try:
+        r = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True)
+    except Exception:
+        return None
+    parent = dict(line.split() for line in r.stdout.splitlines() if len(line.split()) == 2)
+    pid, seen = str(os.getpid()), set()
+    while pid in parent and pid not in seen:
+        seen.add(pid)
+        pid = parent[pid]
+        if pid in pids:
+            return pid
+    return None
 
 
 def quit_desktop(timeout=30):
-    if not desktop_running():
+    """True once Claude Desktop has quit. DesktopCheckError passes through: a failed check is not a quit."""
+    pids = desktop_running()
+    if not pids:
         return True
+    inside = desktop_ancestor(pids)
+    if inside:
+        say(f"Warning: this command is running inside Claude Desktop (PID {inside}). Quitting the app "
+            "will most likely stop it before it copies anything. Run it from Terminal.app instead.", "yellow")
     say("Quitting Claude Desktop...", "cyan")
     try:
         subprocess.run(["osascript", "-e", f'quit app "{APP_NAME}"'], capture_output=True, text=True, timeout=15)
@@ -1244,16 +1280,23 @@ def cmd_desktop(args):
     if args.list:
         return desktop_list(cards_root)
 
-    if args.quit:
-        if not quit_desktop():
-            say("Claude Desktop did not quit in time. Quit it with Cmd+Q and run again.", "yellow")
-            return 1
-    elif not args.ignore_running and not args.dest_root and not args.dry_run:
-        pids = desktop_running()
-        if pids:
-            say(f"Claude Desktop is still running (PID {', '.join(pids)}).", "yellow")
-            say("Quit it completely with Cmd+Q and run again, or pass --quit to do it for you.", "yellow")
-            return 1
+    try:
+        if args.quit:
+            if not quit_desktop():
+                say("Claude Desktop did not quit in time. Quit it with Cmd+Q and run again.", "yellow")
+                return 1
+        elif not args.ignore_running and not args.dest_root and not args.dry_run:
+            pids = desktop_running()
+            if pids:
+                say(f"Claude Desktop is still running (PID {', '.join(pids)}).", "yellow")
+                say("Quit it completely with Cmd+Q and run again, or pass --quit to do it for you.", "yellow")
+                return 1
+    except DesktopCheckError as e:
+        # The app rewrites its card list when it exits, so writing while it may be open is unsafe.
+        say(f"Could not check whether Claude Desktop is running ({e}), so nothing was copied.", "yellow")
+        override = "--ignore-running instead of --quit" if args.quit else "--ignore-running"
+        say(f"Make sure it has quit completely (Cmd+Q), then run again with {override}.", "yellow")
+        return 1
 
     if args.dest_root:
         dest = Path(args.dest_root).expanduser()

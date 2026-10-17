@@ -305,6 +305,10 @@ host use Claude Desktop's helper there. Add the host with `claude-relay remote a
 **"Claude Desktop is still running"** — The app rewrites its session list when it exits. Use
 `--quit`, or quit with **Cmd+Q** (closing the window only hides it).
 
+**"Could not check whether Claude Desktop is running"** — `pgrep` is missing or failed, so
+`desktop` cannot tell if the app is open and copies nothing. Quit Claude Desktop with **Cmd+Q**,
+then run again with `--ignore-running` (without `--quit`).
+
 **"… has no session folder yet. Open the Code tab …"** — Claude Desktop creates the folder for an
 account the first time you open the Code tab with it.
 

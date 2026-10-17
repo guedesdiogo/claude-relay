@@ -60,12 +60,13 @@ class FakeHome:
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
         return log
 
-    def fake_desktop(self, pid):
-        """Fake pgrep, osascript and open: Claude Desktop runs as `pid` until osascript asks it to quit."""
+    def fake_desktop(self, pid, after_quit=1):
+        """Fake pgrep, osascript and open: Claude Desktop runs as `pid` until osascript asks it to quit.
+        After that, pgrep exits with `after_quit` (1: no match)."""
         log = self.root / "desktop.log"
         gone = self.root / "desktop-quit"
         scripts = {
-            "pgrep": f"#!/bin/sh\necho \"pgrep $*\" >> '{log}'\n[ -e '{gone}' ] && exit 1\necho {pid}\n",
+            "pgrep": f"#!/bin/sh\necho \"pgrep $*\" >> '{log}'\n[ -e '{gone}' ] && exit {after_quit}\necho {pid}\n",
             "osascript": f"#!/bin/sh\necho \"osascript $*\" >> '{log}'\ntouch '{gone}'\n",
             "open": f"#!/bin/sh\necho \"open $*\" >> '{log}'\n",
         }
@@ -75,15 +76,24 @@ class FakeHome:
             script.chmod(script.stat().st_mode | stat.S_IEXEC)
         return log
 
-    def env(self):
+    def break_pgrep(self, code):
+        """Make the fake pgrep fail: it exits 2 on a syntax error and 3 on a fatal one (macOS and procps)."""
+        script = self.bin / "pgrep"
+        script.write_text(f"#!/bin/sh\necho \"pgrep $*\" >> '{self.root / 'desktop.log'}'\n"
+                          f"echo 'pgrep: fake error' >&2\nexit {code}\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+    def env(self, path=None):
         env = dict(os.environ, HOME=str(self.root), NO_COLOR="1", CLAUDE_RELAY_TOKEN_STORE="file",
-                   CLAUDE_RELAY_NO_NOTIFY="1", PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}")
+                   CLAUDE_RELAY_NO_NOTIFY="1",
+                   PATH=path or f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}")
         for k in ("XDG_CONFIG_HOME", "CLAUDE_RELAY_HOME", "CLAUDE_CONFIG_DIR"):
             env.pop(k, None)
         return env
 
-    def relay(self, *args):
-        return subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True, env=self.env())
+    def relay(self, *args, path=None):
+        return subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True,
+                              env=self.env(path))
 
     def run(self, *args):
         return self.relay("desktop", "--ignore-running", *args)
@@ -250,6 +260,70 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("Run it from Terminal.app", r.stdout)
         self.assertIn('osascript -e quit app "Claude"', log.read_text())
         self.assertEqual(len(self.h.cards_of("acctB", "orgB")), 2)
+
+    def test_running_check_fails_closed_when_pgrep_errors(self):
+        self.h.fake_desktop(NOT_AN_ANCESTOR)
+        self.h.login("acctB", "orgB")
+        for code in (2, 3):
+            with self.subTest(code=code):
+                self.h.break_pgrep(code)
+                r = self.h.relay("desktop")
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("Could not check whether Claude Desktop is running "
+                              f"(pgrep exited with code {code}: pgrep: fake error)", r.stdout)
+                self.assertIn("run again with --ignore-running.", r.stdout)
+                self.assertEqual(self.h.cards_of("acctB", "orgB"), [])
+                self.assertFalse(list(self.h.cards.parent.glob("claude-code-sessions_backup_*")))
+
+    def test_running_check_fails_closed_without_pgrep(self):
+        self.h.fake_desktop(NOT_AN_ANCESTOR)
+        (self.h.bin / "pgrep").unlink()
+        self.h.login("acctB", "orgB")
+        # Only fakebin: with no PATH at all, Python would fall back to /bin:/usr/bin and the real pgrep.
+        r = self.h.relay("desktop", path=str(self.h.bin))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("Could not check whether Claude Desktop is running (could not run pgrep", r.stdout)
+        self.assertIn("run again with --ignore-running.", r.stdout)
+        self.assertEqual(self.h.cards_of("acctB", "orgB"), [])
+
+    def test_overrides_do_not_need_the_running_check(self):
+        self.h.fake_desktop(NOT_AN_ANCESTOR)
+        self.h.break_pgrep(2)
+        self.h.login("acctB", "orgB")
+        r = self.h.relay("desktop", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        dest = self.h.root / "dest"
+        r = self.h.relay("desktop", "--dest-root", str(dest))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(list(dest.glob("local_*.json"))), 2)
+        self.assertEqual(self.h.cards_of("acctB", "orgB"), [])
+        r = self.h.relay("desktop", "--ignore-running")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.h.cards_of("acctB", "orgB")), 2)
+
+    def test_quit_does_not_act_without_a_running_check(self):
+        log = self.h.fake_desktop(NOT_AN_ANCESTOR)
+        self.h.break_pgrep(2)
+        self.h.login("acctB", "orgB")
+        r = self.h.relay("desktop", "--quit", "--reopen")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("Could not check whether Claude Desktop is running", r.stdout)
+        self.assertIn("run again with --ignore-running instead of --quit.", r.stdout)
+        self.assertNotIn("osascript", log.read_text())
+        self.assertNotIn("open ", log.read_text())
+        self.assertEqual(self.h.cards_of("acctB", "orgB"), [])
+
+    def test_quit_is_not_confirmed_by_a_failed_check(self):
+        # pgrep sees the app, osascript asks it to quit, then pgrep fails: that is not "it quit".
+        log = self.h.fake_desktop(NOT_AN_ANCESTOR, after_quit=3)
+        self.h.login("acctB", "orgB")
+        r = self.h.relay("desktop", "--quit", "--reopen")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("Could not check whether Claude Desktop is running (pgrep exited with code 3)",
+                      r.stdout)
+        self.assertIn('osascript -e quit app "Claude"', log.read_text())
+        self.assertNotIn("open ", log.read_text())
+        self.assertEqual(self.h.cards_of("acctB", "orgB"), [])
 
     def test_compat_command(self):
         self.h.login("acctA", "orgA")

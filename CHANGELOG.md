@@ -10,6 +10,14 @@
 - New `claude-relay remote install HOST`: copies claude-relay to `~/.local/bin` on the host with the
   account names and Desktop links. Tokens are not copied; add them on the host with `accounts add`.
 
+## 2.1.1 — 2026-10-23
+
+- `claude-relay desktop` (and so `watch`) also brings Claude Desktop's recurring scheduled tasks
+  to the account the app is signed in to. Each account registers its own tasks, so before a
+  switch left them behind and they stopped running. Tasks the account already has, by id, stay
+  as they are; one-time tasks and the record of a task's last run in the other account are not
+  copied. `--dry-run` shows how many would be copied, and the backup covers the task lists.
+
 ## 2.1.0 — 2026-10-23
 
 - New `claude-relay watch`: every 30 s it reads new transcript lines on the Mac and, over SSH, on

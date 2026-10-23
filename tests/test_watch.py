@@ -278,9 +278,10 @@ class WatchTests(unittest.TestCase):
         (dest / "scheduled-tasks.json").write_text(json.dumps(
             {"scheduledTasks": [{"id": "daily", "cronExpression": "30 8 * * *", "enabled": True}],
              "recordedSkips": {}}))
+        self.h.add_tasks("acctA", "orgA", [{"id": "weekly", "cronExpression": "0 9 * * 1", "enabled": True}])
         self.switch_after_limit(quiet=True)
         tasks = json.loads((dest / "scheduled-tasks.json").read_text())
-        self.assertEqual([t["id"] for t in tasks["scheduledTasks"]], ["daily", "claude-relay-resume"])
+        self.assertEqual([t["id"] for t in tasks["scheduledTasks"]], ["daily", "weekly", "claude-relay-resume"])
         self.assertEqual(tasks["recordedSkips"], {})
 
     def test_no_resume_task_without_stopped_sessions(self):

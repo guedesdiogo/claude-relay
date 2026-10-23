@@ -16,6 +16,12 @@
     one. Now it replaces the old card.
   - The summary line says how many cards each rule changed: `updated N from a newer copy;
     archived N archived in another account`.
+  - The account's `archived-sessions.idx`, the sorted list of archived cards that Claude Desktop
+    keeps next to them, is updated with the cards written: archived ones are added, and cards that a
+    newer copy left open are removed. A missing or unreadable index is left alone.
+- A session deleted in this account is no longer copied back from another account. Claude Desktop
+  leaves `deleted_<sessionId uuid>` and `deleted_<cliSessionId>` behind. The card copy and the
+  transcript scan now skip both ids.
 - A copy with newer activity always wins, so a session you continued after archiving it stays
   open. A session you unarchive without continuing it is archived again from the other account.
 - After upgrading, fix the account Claude Desktop is signed in to now. `watch` moves sessions only

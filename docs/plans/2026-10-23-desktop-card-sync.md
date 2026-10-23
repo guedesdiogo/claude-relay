@@ -32,12 +32,24 @@ in both accounts):
    archive.
 5. A replaced card's new `cliSessionId` counts as having a card, so the transcript scan does not
    add one for it.
+6. `archived-sessions.idx` (`{"v":1,"archived":[sessionId, ...]}`, sorted) matches the cards'
+   `isArchived` exactly in both accounts (genesis 221, great 280). The 89 archived cards that
+   2.2.1 copied at 17:34 without touching the index were all in it after Claude Desktop reopened,
+   so the app adds entries from the cards; removal was not observed. The sync adds and removes
+   the ids of the cards it writes, and leaves a missing or unreadable index alone. On a copy of the
+   real folder, the index after the run equals the archived cards (278 and 278).
+7. Deleting a session leaves `deleted_<uuid>` for its sessionId and `deleted_<cliSessionId>` (the
+   2026-10-12 backup has the card for one such pair; both markers have the same timestamp). Both
+   ids count as present in the destination, so the copy and the transcript scan skip them. None of
+   today's 5 markers has a card in another account.
 
 Dry run on the real cards (genesis signed in): `updated 47 from a newer copy; archived 22 archived
 in another account`. All 56 cards archived in great end up archived, 34 of them through the newer
 copy. The 2 cards archived only in genesis stay archived, because genesis has the newer copy.
 
 ## Not changed
+
+- A deletion does not carry over: a session deleted in one account stays in the others.
 
 - No ledger of past syncs. With equally recent copies the archived one wins, so a session
   unarchived without new activity is archived again from the other account (README, "What stays

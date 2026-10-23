@@ -1453,10 +1453,10 @@ def card_version(card):
 def sync_card(src_card, dst_path, dry_run):
     """Bring a card up to date with the same session's card in another account. A newer copy replaces
     it whole: the session went on there. With the same activity, an archived copy archives it, since
-    archiving changes no timestamp. Returns "updated", "archived" or None."""
+    archiving changes no timestamp. Returns ("updated" or "archived", the card written), or (None, None)."""
     dst = load_json(dst_path)
     if not isinstance(dst, dict):
-        return None
+        return None, None
     if card_version(src_card) > card_version(dst):
         card, result = dict(src_card), "updated"
         if dst.get("sessionId"):
@@ -1464,10 +1464,31 @@ def sync_card(src_card, dst_path, dry_run):
     elif card_version(src_card) == card_version(dst) and src_card.get("isArchived") and not dst.get("isArchived"):
         card, result = dict(dst, isArchived=True), "archived"
     else:
-        return None
+        return None, None
     if not dry_run:
         write_json(dst_path, card)  # 0600, like Claude Desktop's own cards
-    return result
+    return result, card
+
+
+def deleted_ids(dest):
+    """Sessions deleted in this account. Claude Desktop leaves deleted_<uuid> for the card's sessionId
+    (local_<uuid>) and deleted_<cliSessionId> for its transcript."""
+    return [p.name[len("deleted_"):] for p in dest.glob("deleted_*") if p.is_file()]
+
+
+def update_archive_index(dest, archived):
+    """Claude Desktop also lists an account's archived cards in archived-sessions.idx, sorted. Bring it
+    in line with the cards this run wrote; `archived` maps their sessionId to isArchived. A missing or
+    unreadable index is left to Claude Desktop."""
+    path = dest / "archived-sessions.idx"
+    data = load_json(path) if path.exists() else None
+    if not isinstance(data, dict) or not isinstance(data.get("archived"), list):
+        return
+    ids = set(data["archived"])
+    new = (ids | {s for s, a in archived.items() if a}) - {s for s, a in archived.items() if not a}
+    if new != ids:
+        data["archived"] = sorted(new)
+        write_json(path, data)  # 0600, like Claude Desktop's own copy
 
 
 TASK_RUN_FIELDS = ("lastRunAt", "lastScheduledFor", "notifySessionId")
@@ -1596,8 +1617,12 @@ def cmd_desktop(args):
 
     # The destination's cards by cliSessionId and by sessionId. A card keeps its sessionId (and file
     # name) in every account, while Claude Desktop can move it to a new transcript (cliSessionId).
+    # A session deleted here counts as present (None), so neither copying nor the transcript scan
+    # brings it back.
     have, by_id = {}, {}
     if dest.exists():
+        for d in deleted_ids(dest):
+            have[d.lower()] = by_id[f"local_{d}"] = None
         for f in dest.glob("local_*.json"):
             o = load_json(f)
             if isinstance(o, dict) and o.get("cliSessionId"):
@@ -1607,12 +1632,15 @@ def cmd_desktop(args):
     sources = [(f, load_json(f)) for f in all_cards if not same_dir(f.parent, dest)]
     sources = [(f, o) for f, o in sources if isinstance(o, dict) and o.get("cliSessionId")]
     copied = updated = archived = 0
+    archive_state = {}  # sessionId -> isArchived of the cards written, for archived-sessions.idx
     for f, o in sorted(sources, key=lambda s: card_version(s[1]), reverse=True):  # newest copy first
         key, sid = str(o["cliSessionId"]).lower(), o.get("sessionId") or f.stem
         if sid in by_id or key in have:
             match = by_id.get(sid) or have.get(key)
-            if match is not None:  # None: a card this dry run would copy
-                result = sync_card(o, match, args.dry_run)
+            if match is not None:  # None: deleted here, or a card this dry run would copy
+                result, card = sync_card(o, match, args.dry_run)
+                if result:
+                    archive_state[card.get("sessionId") or match.stem] = bool(card.get("isArchived"))
                 updated += result == "updated"
                 archived += result == "archived"
                 have.setdefault(key, match)  # its transcript has a card now
@@ -1623,7 +1651,10 @@ def cmd_desktop(args):
                 target = dest / f"local_{uuid.uuid4()}.json"
             shutil.copy2(f, target)
         have[key] = by_id[sid] = target if not args.dry_run else None
+        archive_state[sid] = bool(o.get("isArchived"))
         copied += 1
+    if not args.dry_run:
+        update_archive_index(dest, archive_state)
     say(f"{'Would copy' if args.dry_run else 'Copied'} {copied} card(s) from other accounts"
         f"{f'; updated {updated} from a newer copy' if updated else ''}"
         f"{f'; archived {archived} archived in another account' if archived else ''}.", "green")

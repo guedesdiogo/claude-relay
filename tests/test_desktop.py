@@ -225,6 +225,49 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(self.card("acctA", "orgA", "local_card"), newer)
         self.assertIn("updated 1 from a newer copy", r.stdout)
 
+    def test_archive_index_follows_the_cards(self):
+        # Claude Desktop also lists each account's archived cards in archived-sessions.idx (sorted).
+        index = self.h.cards / "acctA" / "orgA" / "archived-sessions.idx"
+        index.write_text(json.dumps({"v": 1, "archived": ["local_S0", "local_S8"]}))
+        self.h.add_card("acctA", "orgA", "S8", last=100, isArchived=True)  # continued in B since
+        self.h.add_card("acctB", "orgB", "S8", last=200, isArchived=False)
+        self.h.add_card("acctA", "orgA", "S9", last=100)
+        self.h.add_card("acctB", "orgB", "S9", last=100, isArchived=True)
+        self.h.add_card("acctB", "orgB", "S7", last=50, isArchived=True)  # new here
+        self.h.desktop_login("acctA")
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(index.read_text()), {"v": 1, "archived": ["local_S0", "local_S7", "local_S9"]})
+        self.assertEqual(index.stat().st_mode & 0o777, 0o600)
+
+    def test_archive_index_is_left_to_claude_desktop_when_missing_or_unreadable(self):
+        self.h.add_card("acctB", "orgB", "S9", isArchived=True)
+        self.h.desktop_login("acctA")
+        index = self.h.cards / "acctA" / "orgA" / "archived-sessions.idx"
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(index.exists())
+        index.write_text("{not json")
+        self.h.add_card("acctB", "orgB", "S8", isArchived=True)
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(index.read_text(), "{not json")
+
+    def test_session_deleted_here_is_not_copied_back(self):
+        # Deleting a session leaves deleted_<uuid> for its sessionId and deleted_<cliSessionId>.
+        here = self.h.cards / "acctA" / "orgA"
+        (here / "deleted_card1").write_text("1792094249469")
+        (here / "deleted_S10").write_text("1792094249469")
+        self.h.add_card("acctB", "orgB", "S9", sessionId="local_card1", last=500)
+        self.h.add_card("acctB", "orgB", "S10", sessionId="local_card2", last=500)
+        self.h.add_transcript("S10", [{"type": "user", "cwd": "/Users/x/proj",
+                                       "timestamp": "2026-10-03T10:00:00Z", "message": {"content": "hi"}}])
+        self.h.desktop_login("acctA")
+        r = self.h.run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sorted(c["cliSessionId"] for c in self.h.cards_of("acctA", "orgA")), ["S1", "S2"])
+        self.assertIn("Copied 0 card(s) from other accounts.", r.stdout)
+
     def test_dry_run_counts_card_updates_without_writing(self):
         self.h.add_card("acctA", "orgA", "S8", last=100)
         self.h.add_card("acctB", "orgB", "S8", last=200)

@@ -177,6 +177,7 @@ Sessions this account already had are brought up to date too:
   branch, pull requests, errors. This also applies when Claude Desktop moved it to a new
   transcript.
 - A session you archived in another account, with no activity since, is archived here too.
+- A session you deleted in this account is not copied back from the others.
 
 Useful shortcut:
 
@@ -364,7 +365,9 @@ account from Claude Desktop's own config (`lastKnownAccountUuid`; Claude Desktop
 `~/.claude.json`), backs up the card folder, copies cards from other accounts, and optionally
 creates cards for CLI / VS Code transcripts. A card the account already has (same `sessionId`, or
 the same `cliSessionId`) is replaced by a copy with newer activity (`lastActivityAt`, then
-`latestUserFrameAt`), or archived when an equally recent copy is archived. It
+`latestUserFrameAt`), or archived when an equally recent copy is archived; the account's
+`archived-sessions.idx` is kept in line with the cards. Sessions with a `deleted_<id>` marker in
+the account are skipped. It
 also adds the other accounts' recurring scheduled tasks to `scheduled-tasks.json` in the same
 folder, without the record of their last run there; the task prompts live in
 `~/.claude/scheduled-tasks/<id>/SKILL.md` and are shared by all accounts.

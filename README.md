@@ -160,9 +160,10 @@ supported way to do that), but it handles everything else.
    claude-relay desktop --existing-cards-only --quit --reopen
    ```
 
-It quits Claude Desktop, copies the session list from your other accounts into this one (and
-updates sessions you continued elsewhere), restarts Claude Desktop's helpers on the SSH hosts you
-configured, and opens the app again. Your sessions are there; continue any of them.
+It quits Claude Desktop, copies the session list and the recurring scheduled tasks from your
+other accounts into this one (and updates sessions you continued elsewhere), restarts Claude
+Desktop's helpers on the SSH hosts you configured, and opens the app again. Your sessions are
+there; continue any of them.
 
 Useful shortcut:
 
@@ -173,8 +174,14 @@ alias claude-switch='claude-relay desktop --existing-cards-only --quit --reopen'
 Leave out `--existing-cards-only` if you also want sessions you started from the `claude` CLI or
 VS Code to appear in the app. Run `claude-relay desktop --dry-run` first to see how many that is.
 
-**What stays per account:** usage limits, scheduled tasks, claude.ai connectors and cloud sessions
-(Claude Code on the web). Archived status is per account too.
+**Scheduled tasks:** each account keeps its own list. Recurring tasks from your other accounts are
+added to this one unless it already has a task with the same id; one-time tasks stay behind. A
+change you make to a task (its schedule, turning it off) stays in the account where you made it,
+and a task you delete in one account comes back from the others on the next switch, so delete it
+in each account.
+
+**What stays per account:** usage limits, one-time scheduled tasks, claude.ai connectors and cloud
+sessions (Claude Code on the web). Archived status is per account too.
 
 ---
 
@@ -321,7 +328,10 @@ account, in
 pointing at a transcript through `cliSessionId`. `claude-relay desktop` reads the signed-in
 account from Claude Desktop's own config (`lastKnownAccountUuid`; Claude Desktop does not update
 `~/.claude.json`), backs up the card folder, copies cards from other accounts, updates cards whose
-copy elsewhere has newer activity, and optionally creates cards for CLI / VS Code transcripts.
+copy elsewhere has newer activity, and optionally creates cards for CLI / VS Code transcripts. It
+also adds the other accounts' recurring scheduled tasks to `scheduled-tasks.json` in the same
+folder, without the record of their last run there; the task prompts live in
+`~/.claude/scheduled-tasks/<id>/SKILL.md` and are shared by all accounts.
 Remote helpers live in `~/.claude/remote/` on each SSH host.
 
 **`watch`** looks for turns that failed on the usage limit: transcript entries with

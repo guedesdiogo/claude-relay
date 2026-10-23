@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -709,14 +709,27 @@ def print_availability(cfg, state):
             say(f"  {a['name']}: available", "white", err=True)
 
 
+# Claude Code subcommands (`claude --help`, Claude Code 2.1.309, plus older names) and print-only flags.
+# `run` hands them to plain `claude`, so `alias claude='claude-relay run'` keeps `claude setup-token`,
+# `claude mcp list`... working.
+PASSTHROUGH = {
+    "agents", "attach", "auth", "auto-mode", "config", "doctor", "gateway", "import", "install", "kill", "logs",
+    "mcp", "migrate-installer", "plugin", "plugins", "purge", "respawn", "rm", "setup-token", "stop",
+    "ultrareview", "update", "upgrade", "-h", "--help", "-v", "--version",
+}
+
+
 def cmd_run(claude_args):
     cfg = load_config()
-    if not cfg["accounts"]:
-        die(f"No accounts configured. Add them first:\n  {PROG} accounts add <name>   "
-            "(paste a token from `claude setup-token`)")
     claude_bin = os.environ.get("CLAUDE_RELAY_CLAUDE_BIN") or cfg.get("claude_bin") or "claude"
     if not shutil.which(claude_bin) and not os.path.exists(claude_bin):
         die(f"Could not find '{claude_bin}'. Install Claude Code or set: {PROG} config claude_bin <path>")
+    if claude_args and claude_args[0] in PASSTHROUGH:
+        os.execvp(claude_bin, [claude_bin] + list(claude_args))
+    if not any(token_get(a["name"], a.get("store", "file")) for a in cfg["accounts"]):
+        say(f"{PROG}: no account has a token yet, so this is plain `claude`. Add one with: "
+            f"{PROG} accounts add <name>   (token from `claude setup-token`)", "yellow", err=True)
+        os.execvp(claude_bin, [claude_bin] + list(claude_args))
 
     argv, user_settings = split_settings_arg(list(claude_args))
     printing = is_print_mode(argv)

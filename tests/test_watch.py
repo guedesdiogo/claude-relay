@@ -380,9 +380,11 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(resume["sessions"][0]["sessionId"], "local_S1")
         self.assertEqual(resume["sessions"][0]["host"], "local")
         self.assertEqual(self.h.state()["watch"]["restored"], "acctB")
-        self.assertIn("1 session(s) stopped on the limit", r.stdout)
+        self.assertIn("1 session(s) stopped on the limit. List: ", r.stdout)  # nothing to do by hand
         # A one-time Desktop scheduled task, already due, resumes them when the app reopens.
-        tasks = json.loads((self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json").read_text())
+        path = self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json"
+        tasks = json.loads(path.read_text())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)  # as Claude Desktop keeps it
         task = next(t for t in tasks["scheduledTasks"] if t["id"] == "claude-relay-resume")
         self.assertTrue(task["enabled"])
         self.assertLessEqual(task["fireAt"], time.time() * 1000)
@@ -405,6 +407,28 @@ class WatchTests(unittest.TestCase):
         tasks = json.loads((dest / "scheduled-tasks.json").read_text())
         self.assertEqual([t["id"] for t in tasks["scheduledTasks"]], ["daily", "weekly", "claude-relay-resume"])
         self.assertEqual(tasks["recordedSkips"], {})
+        self.assertEqual((dest / "scheduled-tasks.json").stat().st_mode & 0o777, 0o600)
+
+    def assert_unreadable_scheduled_tasks_are_left_alone(self, content):
+        path = self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(content)
+        r = self.switch_after_limit(quiet=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(path.read_bytes(), content)
+        self.assertIn("so the resume task was not added", r.stdout)
+        self.assertFalse((self.h.root / ".claude" / "scheduled-tasks" / "claude-relay-resume").exists())
+        self.assertIn("open -a Claude", self.desktop_log.read_text())  # the switch still finishes
+        # The same text goes to the macOS notification, so it says that the sessions will not resume.
+        line = next(l for l in r.stdout.splitlines() if "Sessions moved to" in l)
+        self.assertIn("1 session(s) stopped on the limit. Resume them by hand: the list is in "
+                      f"{self.h.root / '.config' / 'claude-relay' / 'resume.json'}.", line)
+
+    def test_unreadable_scheduled_tasks_file_is_left_alone(self):
+        self.assert_unreadable_scheduled_tasks_are_left_alone(b"{not json")
+
+    def test_scheduled_tasks_that_are_not_a_list_are_left_alone(self):
+        self.assert_unreadable_scheduled_tasks_are_left_alone(b'{"scheduledTasks": {"daily": {}}}')
 
     def test_no_resume_task_without_stopped_sessions(self):
         self.h.relay("remote", "add", "devbox")

@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.2.4 — 2026-10-23
+
+- When `watch` cannot add the task that resumes the sessions stopped on a limit, its macOS
+  notification now says so: `Sessions moved to X; N session(s) stopped on the limit. Resume them by
+  hand: the list is in <resume.json>.` Until now only `watch.log` said that they would not resume.
+
+## 2.2.3 — 2026-10-23
+
+- The one-time task that `watch` registers to resume sessions stopped on a limit no longer widens
+  the account's `scheduled-tasks.json` to 0644; it stays 0600, as Claude Desktop keeps it.
+- When that file cannot be read (not JSON, or `scheduledTasks` is not a list), `watch` leaves it
+  as it is and says the resume task was not added, instead of replacing it and erasing the
+  account's scheduled tasks. Resume the sessions in `resume.json` by hand in that case.
+
 ## 2.2.2 — 2026-10-23
 
 - `claude-relay reset NAME` and `use NAME` now clear an exhausted mark on every machine. Before,

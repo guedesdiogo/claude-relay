@@ -28,6 +28,15 @@
   when the account changes. Quit Claude Desktop (Cmd+Q) and run in Terminal.app:
   `claude-relay desktop --existing-cards-only --reopen`.
 
+## 2.2.6 — 2026-10-23
+
+- When `watch` cannot write `resume.json`, the list of sessions stopped on a limit, it now finishes
+  the switch anyway: it reopens Claude Desktop, saves its state and sends the notification. It adds
+  no resume task, since the task reads that file, and the notification names the sessions to resume
+  by hand: `Resume them by hand: "<title>", ...`. Until now the error ended that pass with the app
+  still closed and no notification, and the saved state still had the old account, so the next pass
+  started the move over.
+
 ## 2.2.5 — 2026-10-23
 
 - When `watch` cannot write the task that resumes the sessions stopped on a limit (for example a

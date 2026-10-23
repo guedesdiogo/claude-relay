@@ -223,7 +223,9 @@ keep it open everywhere.
    already due, so the app runs it as it opens. The task sends each session `resume_prompt`, 10 at a
    time. The first run may ask you to approve sending messages; allow it always. If the task cannot
    be added (the account's `scheduled-tasks.json` cannot be read, or a write fails), the
-   notification says to resume the sessions by hand from `~/.config/claude-relay/resume.json`.
+   notification says to resume the sessions by hand from `~/.config/claude-relay/resume.json`. If
+   `resume.json` itself cannot be written, no task is added and the notification names the sessions
+   to resume by hand.
 6. The terminal follows. Every pass, `watch` tells the Mac and every host which account Claude
    Desktop uses (its `accounts link` name). `claude-relay run` starts on that account, and a running
    session moves to it at the end of its current turn, resuming the same conversation. This holds

@@ -1357,26 +1357,24 @@ def copy_scheduled_tasks(cards_root, dest, dry_run):
     when `dest`'s file exists but cannot be read."""
     path = dest / "scheduled-tasks.json"
     data = load_json(path) if path.exists() else {}
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or not isinstance(data.get("scheduledTasks") or [], list):
         return None
     tasks = list(data.get("scheduledTasks") or [])
-    have = {t.get("id") for t in tasks if isinstance(t, dict)}
+    have = {None, RESUME_TASK} | {t.get("id") for t in tasks if isinstance(t, dict)}
     copied = 0
     # Newest file first: when two accounts have the same task, the one used last wins.
     for src in sorted(cards_root.glob("*/*/scheduled-tasks.json"), key=lambda p: (-p.stat().st_mtime, str(p))):
-        other = load_json(src)
-        if same_dir(src.parent, dest) or not isinstance(other, dict):
+        if same_dir(src.parent, dest):
             continue
-        for t in other.get("scheduledTasks") or []:
-            if not isinstance(t, dict) or not t.get("cronExpression") or t.get("id") in have or \
-                    t.get("id") in (None, RESUME_TASK):
-                continue
-            tasks.append({k: v for k, v in t.items() if k not in TASK_RUN_FIELDS})
-            have.add(t["id"])
-            copied += 1
+        other = load_json(src)
+        for t in (other.get("scheduledTasks") if isinstance(other, dict) else None) or []:
+            if isinstance(t, dict) and t.get("cronExpression") and t.get("id") not in have:
+                tasks.append({k: v for k, v in t.items() if k not in TASK_RUN_FIELDS})
+                have.add(t["id"])
+                copied += 1
     if copied and not dry_run:
         data["scheduledTasks"] = tasks
-        write_json(path, data, mode=0o644)
+        write_json(path, data)  # 0600, like Claude Desktop's own copy
     return copied
 
 

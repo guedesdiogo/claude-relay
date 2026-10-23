@@ -55,7 +55,7 @@ def main():
     argv = sys.argv[1:]
     clean = argv[:argv.index("--settings")] + argv[argv.index("--settings") + 2:] if "--settings" in argv else argv
     log({"call": call, "argv": clean, "token": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"),
-         "account": os.environ.get("CLAUDE_RELAY_ACCOUNT"),
+         "account": os.environ.get("CLAUDE_RELAY_ACCOUNT"), "settings": "--settings" in argv,
          "api_key": os.environ.get("ANTHROPIC_API_KEY")})
     future = int(time.time()) + 3600
     sid = "sess-1"
@@ -80,6 +80,16 @@ def main():
         with open(path) as f:
             state = json.load(f)
         state["exhausted"][os.environ["CLAUDE_RELAY_ACCOUNT"]] = {"until": future, "reason": "hit its weekly limit"}
+        with open(path, "w") as f:
+            json.dump(state, f)
+        hook("Stop", {"session_id": sid, "hook_event_name": "Stop"})
+        wait_for_term()
+    elif SCENARIO == "desktop-switch":
+        # `claude-relay watch` publishes that Claude Desktop is now on another account.
+        path = os.path.join(os.environ["CLAUDE_RELAY_HOME"], "state.json")
+        with open(path) as f:
+            state = json.load(f)
+        state["desktop"], state["desktop_at"] = os.environ.get("FAKE_DESKTOP", "b"), time.time()
         with open(path, "w") as f:
             json.dump(state, f)
         hook("Stop", {"session_id": sid, "hook_event_name": "Stop"})

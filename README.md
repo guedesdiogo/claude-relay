@@ -99,6 +99,10 @@ claude-relay accounts add personal
 claude-relay accounts list
 ```
 
+A narrow terminal may break the token over several lines when you copy it. Paste it as it is:
+claude-relay joins the lines back. The prompt, `pbpaste | claude-relay accounts add NAME` and
+`--token-file PATH` all accept a split token. A piece of a token is refused, and nothing is saved.
+
 On macOS tokens go into the **Keychain**; on Linux into `~/.config/claude-relay/tokens/` with
 permissions `600`. The first account you add is the one used first.
 
@@ -115,6 +119,9 @@ To use it every time, add an alias to `~/.zshrc` or `~/.bashrc`:
 ```bash
 alias claude='claude-relay run'
 ```
+
+Subcommands such as `claude setup-token`, `claude mcp list` or `claude update`, and `--version` /
+`--help`, go straight to plain `claude`. So does everything else while no account has a token yet.
 
 The status line shows which account is in use and how much of it you have used:
 
@@ -194,7 +201,10 @@ sessions (Claude Code on the web). Archived status is per account too.
    time in its transcript.
 2. It marks that account as exhausted until then, on the Mac and on every host, so
    `claude-relay run` skips it everywhere. A `claude-relay run` already on that account switches
-   at the end of its current turn.
+   at the end of its current turn. To clear a mark, run `claude-relay reset NAME` or
+   `claude-relay use NAME` on any of these machines. A new token from `claude-relay accounts add NAME`
+   also clears a "token rejected" mark. The next pass clears the mark everywhere. A limit hit after
+   that marks the account again.
 3. It sends a notification: *"work hit its weekly limit until Thu 22 Oct 17:00. Sign Claude Desktop
    in to home."*
 4. When Claude Desktop is signed in to another account and no session has written for a minute, it
@@ -203,6 +213,12 @@ sessions (Claude Code on the web). Archived status is per account too.
    `~/.config/claude-relay/resume.json` and registers a one-time Claude Desktop scheduled task,
    already due, so the app runs it as it opens. The task sends each session `resume_prompt`, 10 at a
    time. The first run may ask you to approve sending messages; allow it always.
+6. The terminal follows. Every pass, `watch` tells the Mac and every host which account Claude
+   Desktop uses (its `accounts link` name). `claude-relay run` starts on that account, and a running
+   session moves to it at the end of its current turn, resuming the same conversation. This holds
+   whether you switched Claude Desktop by hand or because of a limit. If that account is exhausted
+   or has no token on that machine, `run` uses another one. Turn this off with
+   `claude-relay config follow_desktop false`.
 
 **What you still do:**
 
@@ -210,20 +226,28 @@ sessions (Claude Code on the web). Archived status is per account too.
 | ---- | ---- |
 | Each switch | Sign Claude Desktop in to the account the notification names, and open the Code tab. |
 | Once per account | `claude-relay accounts link NAME ACCOUNT_ID` (ids from `claude-relay desktop --list`). |
-| Once per account per year | `claude setup-token` and `claude-relay accounts add NAME` on each machine where you use `claude-relay run`. |
+| Once per account per year | `claude setup-token`, then `claude-relay accounts add NAME` on each machine where you use the terminal (the same token works on all of them). |
 | Once | `claude-relay service install` (starts `watch` now and at every login). |
+| Once per host, and after each upgrade | `claude-relay remote install HOST` (copies claude-relay and the account names there). |
+| Once per machine | Start Claude through claude-relay: `alias claude='claude-relay run'` in your shell. |
 
 ```bash
 claude-relay desktop --list                  # account ids
 claude-relay accounts link work <id-1>       # name them
 claude-relay accounts link home <id-2>
+claude-relay accounts add work               # token from `claude setup-token`
+claude-relay accounts add home
 claude-relay remote add my-server
+claude-relay remote install my-server        # then, on my-server: claude-relay accounts add work/home
 claude-relay service install
 claude-relay service status                  # running? last lines of the log
 ```
 
-SSH hosts need nothing running and, for `watch`, nothing installed: the Mac sends the script to
-`python3 -` over SSH. Install claude-relay on a host only to use `claude-relay run` there.
+SSH hosts need nothing running, and `watch` needs nothing installed on them: the Mac sends the
+script to `python3 -` over SSH. Install claude-relay on a host (`remote install`) to use
+`claude-relay run` there. Tokens are never copied between machines.
+
+A plain `claude` started without claude-relay keeps its own `/login` account and does not follow.
 
 Errors from before `watch` started are ignored: it only knows which account they belong to from
 the moment it sees Claude Desktop signed in. Rotating accounts automatically is exactly what
@@ -265,9 +289,10 @@ are interrupted, so let replies finish before switching (`watch` waits for that 
 | `claude-relay accounts remove NAME` | Forget an account and delete its token. |
 | `claude-relay accounts link NAME ACCOUNT_ID` | Name a Claude Desktop account, so `watch` marks and names it. |
 | `claude-relay use NAME` | Make an account the first choice. |
-| `claude-relay reset [NAME]` | Forget recorded usage, so skipped accounts are tried again. |
+| `claude-relay reset [NAME]` | Forget recorded usage, so skipped accounts are tried again (on every machine, through `watch`). |
 | `claude-relay config [KEY [VALUE]]` | Show or change settings. |
 | `claude-relay remote add/remove/list HOST` | SSH hosts that `desktop` restarts and `watch` keeps in sync. |
+| `claude-relay remote install HOST` | Copy claude-relay to `~/.local/bin` on the host, with the account names and Desktop links (not the tokens). |
 | `claude-relay desktop [options]` | Move Code-tab sessions to the account Claude Desktop is signed into. |
 | `claude-relay watch [--once] [--interval S]` | Follow usage limits and Claude Desktop account switches (see above). |
 | `claude-relay service install/uninstall/status` | Run `watch` as a launchd agent (macOS). Log: `~/.config/claude-relay/watch.log`. |
@@ -298,6 +323,7 @@ are interrupted, so let replies finish before switching (`watch` waits for that 
 | `cooldown_minutes` | `30` | How long to skip an account that hit its limit when its reset time is unknown. |
 | `claude_bin` | `claude` | The Claude Code command to start. |
 | `notify` | `true` | macOS notification when an account switch happens. |
+| `follow_desktop` | `true` | `run` uses the account Claude Desktop uses (published by `watch`) and moves with it. |
 | `resume_prompt` | *(see `config`)* | What `watch`'s resume task sends to each session that stopped on the limit. |
 
 Files live in `~/.config/claude-relay/` (or `$XDG_CONFIG_HOME/claude-relay`, or
@@ -338,8 +364,10 @@ Remote helpers live in `~/.claude/remote/` on each SSH host.
 `"entrypoint": "claude-desktop"`, `"error": "rate_limit"` and `"quotaLimits": {"status": "rejected",
 "resetsAt": …}` (verified with Claude Code 2.1.299). Temporary capacity errors are ignored, and so
 are terminal sessions, which `claude-relay run` already handles. Each error belongs to the account
-Claude Desktop was signed in to at that moment. Marks are merged between machines (the later
-reset wins).
+Claude Desktop was signed in to at that moment. Marks are merged between machines, and the later
+reset wins. Each mark records when it was made (`since`). Each machine records when each account's
+mark was last cleared (`cleared`). Marks older than the account's last clear are dropped. Marks from
+before 2.2.2 have no `since` and count as older.
 
 The Claude Desktop file format was worked out by observation and may change in any app update.
 
@@ -389,7 +417,8 @@ have separate logins. Use `claude-relay run`, or `/login` inside `claude`.
 `claude-relay desktop` prints a note when they differ.
 
 **An account is skipped although it has usage left** — `claude-relay accounts list` shows why and
-until when. `claude-relay reset NAME` makes claude-relay try it again.
+until when. `claude-relay reset NAME` makes claude-relay try it again, on every machine `watch`
+reaches. If the reason is "token rejected", add a new token with `claude-relay accounts add NAME`.
 
 **No usage shown for an account** — Usage comes from Claude Code's status line, which only
 receives it for Pro and Max subscriptions and only after the first reply.

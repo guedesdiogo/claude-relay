@@ -70,8 +70,10 @@ class Env:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-TOKEN_A = "sk-ant-oat01-" + "a" * 40
-TOKEN_B = "sk-ant-oat01-" + "b" * 40
+TOKEN_A = "sk-ant-oat01-" + "a" * 95  # 108 characters, like a token from `claude setup-token`
+TOKEN_B = "sk-ant-oat01-" + "b" * 95
+SPLIT = "sk-ant-oat01-" + "Ab3_" * 23 + "x-y"  # 108 characters, pasted from a narrow terminal below
+SPLIT_LINES = [SPLIT[:51], SPLIT[51:73], SPLIT[73:]]  # the pieces seen on the Mac: 51 and 73 characters
 
 
 class AccountTests(unittest.TestCase):
@@ -96,6 +98,57 @@ class AccountTests(unittest.TestCase):
         self.e.relay("accounts", "remove", "home")
         self.assertFalse(token_file.exists())
         self.assertNotIn("home", self.e.relay("accounts", "list").stdout)
+
+    def saved_token(self, name):
+        return (self.e.home_cfg / "tokens" / name).read_text().strip()
+
+    def test_token_broken_over_lines_is_joined(self):
+        a, b, c = SPLIT_LINES
+        pasted = f"\n{a}\n  {b}  \n{c}\n\nStore this token securely.\n"
+        r = self.e.relay("accounts", "add", "work", stdin=pasted)  # `pbpaste | claude-relay accounts add`
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.saved_token("work"), SPLIT)
+        token_file = self.e.root / "home.token"
+        token_file.write_text(f"{a}\n{b}\n{c}\n")
+        r = self.e.relay("accounts", "add", "home", "--token-file", str(token_file))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.saved_token("home"), SPLIT)
+        quoted = f"export CLAUDE_CODE_OAUTH_TOKEN='{SPLIT[:60]}\n{SPLIT[60:]}'\n"
+        self.assertEqual(relay.parse_token_text(quoted), SPLIT)
+        self.assertEqual(relay.parse_token_text(f"{SPLIT}\nStore this token securely.\n"), SPLIT)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs a pseudo-terminal")
+    def test_hidden_prompt_reads_a_token_pasted_over_lines(self):
+        import pty
+        import select
+        pid, master = pty.fork()
+        if pid == 0:  # the child's stdin and /dev/tty are the pseudo-terminal, as in Terminal.app
+            os.execve(sys.executable, [sys.executable, str(CLI), "accounts", "add", "work"], self.e.env())
+        out, pasted, deadline = b"", False, time.time() + 30
+        while time.time() < deadline:
+            if not pasted and b"Token: " in out:
+                os.write(master, ("\n".join(SPLIT_LINES) + "\n").encode())  # one paste, three lines
+                pasted = True
+            if not select.select([master], [], [], 1)[0]:
+                continue
+            try:
+                data = os.read(master, 4096)
+            except OSError:  # Linux: the child closed the terminal
+                data = b""
+            if not data:
+                break
+            out += data
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.WEXITSTATUS(status), 0, out)
+        self.assertEqual(self.saved_token("work"), SPLIT)
+        self.assertNotIn(SPLIT_LINES[1].encode(), out)  # not echoed
+
+    def test_part_of_a_token_is_refused(self):
+        for piece in (SPLIT_LINES[0], SPLIT[:73], "x" * 108):
+            r = self.e.relay("accounts", "add", "work", stdin=piece + "\n")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("Paste the whole token", r.stderr)
+        self.assertFalse((self.e.home_cfg / "tokens" / "work").exists())
 
     def test_rejects_garbage_token(self):
         r = self.e.relay("accounts", "add", "x", stdin="hello\n")
@@ -196,14 +249,49 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.e.state()["active"], "b")
         self.assertIn("switching to 'b'", r.stderr)
 
+    def test_starts_on_the_claude_desktop_account(self):
+        published = {"active": "a", "usage": {}, "exhausted": {}, "desktop": "b", "desktop_at": time.time()}
+        self.e.write_state(published)
+        r = self.e.relay("run", FAKE_SCENARIO="exit")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.e.calls()[0]["account"], "b")
+        self.assertIn("run` follows Claude Desktop's account (b)", self.e.relay("use", "a").stdout)
+        for state, cfg in ((dict(published, desktop_at=time.time() - 3600), None),  # watch stopped
+                           (published, "false")):
+            if cfg:
+                self.e.relay("config", "follow_desktop", cfg)
+            self.e.write_state(state)
+            self.e.log.write_text("")
+            self.e.relay("run", FAKE_SCENARIO="exit")
+            self.assertEqual(self.e.calls()[0]["account"], "a")
+
+    def test_switches_after_turn_when_claude_desktop_switches(self):
+        r = self.e.relay("run", "fix the bug", FAKE_SCENARIO="desktop-switch")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.e.calls()
+        self.assertEqual([c["account"] for c in calls], ["a", "b"])
+        self.assertEqual(calls[1]["argv"], ["--resume", "sess-1"])  # no prompt: the turn had ended
+        self.assertIn("'a' is not the account Claude Desktop uses; switching to 'b'", r.stderr)
+
+    def test_does_not_follow_an_exhausted_desktop_account(self):
+        future = time.time() + 3600
+        self.e.write_state({"active": "a", "usage": {}, "desktop": "b", "desktop_at": time.time(),
+                            "exhausted": {"b": {"until": future, "reason": "hit its weekly limit"}}})
+        r = self.e.relay("run", FAKE_SCENARIO="desktop-switch", FAKE_WAIT="3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([c["account"] for c in self.e.calls()], ["a"])
+
     def test_switches_and_continues_on_limit(self):
+        started = time.time()
         r = self.e.relay("run", "fix the bug", FAKE_SCENARIO="limit")
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = self.e.calls()
         self.assertEqual([c["account"] for c in calls], ["a", "b"])
         self.assertEqual(calls[1]["argv"], ["--resume", "sess-1", CONTINUE])
-        self.assertGreater(self.e.state()["exhausted"]["a"]["until"], time.time())
-        self.assertEqual(self.e.state()["exhausted"]["a"]["reason"], "hit its usage limit")
+        mark = self.e.state()["exhausted"]["a"]
+        self.assertGreater(mark["until"], time.time())
+        self.assertEqual(mark["reason"], "hit its usage limit")
+        self.assertGreater(mark["since"], started)  # so a clear made before the run does not drop it
 
     def test_switches_after_turn_when_marked_exhausted_elsewhere(self):
         r = self.e.relay("run", "fix the bug", FAKE_SCENARIO="marked-elsewhere")
@@ -277,11 +365,44 @@ class RunTests(unittest.TestCase):
         self.assertTrue(line.startswith("MY-LINE"), line)
         self.assertIn("⇄ a", line)
 
+    def plain(self, call):
+        """Started as plain `claude`: no token, no claude-relay settings."""
+        self.assertIsNone(call["token"])
+        self.assertIsNone(call["account"])
+        self.assertFalse(call["settings"])
+
+    def test_subcommands_go_straight_to_claude(self):
+        # `alias claude='claude-relay run'` must keep `claude setup-token`, `claude mcp list`... working.
+        for argv in (["setup-token"], ["mcp", "list"], ["update"], ["--version"]):
+            with self.subTest(argv=argv):
+                self.e.log.write_text("")
+                r = self.e.relay("run", *argv, FAKE_SCENARIO="exit")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                calls = self.e.calls()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["argv"], argv)
+                self.plain(calls[0])
+
+    def test_without_any_token_runs_plain_claude(self):
+        e = Env()
+        try:
+            e.relay("accounts", "link", "a", "uuid-1")  # an account, but no token yet
+            r = e.relay("run", "hello", FAKE_SCENARIO="exit")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(e.calls()[0]["argv"], ["hello"])
+            self.plain(e.calls()[0])
+            self.assertIn("no account has a token yet", r.stderr)
+            self.assertIn("accounts add", r.stderr)
+        finally:
+            e.cleanup()
+
     def test_no_accounts(self):
         e = Env()
         try:
-            r = e.relay("run")
-            self.assertEqual(r.returncode, 1)
+            r = e.relay("run", FAKE_SCENARIO="exit")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(e.calls()[0]["argv"], [])
+            self.plain(e.calls()[0])
             self.assertIn("accounts add", r.stderr)
         finally:
             e.cleanup()

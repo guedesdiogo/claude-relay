@@ -84,6 +84,16 @@ def main():
             json.dump(state, f)
         hook("Stop", {"session_id": sid, "hook_event_name": "Stop"})
         wait_for_term()
+    elif SCENARIO == "desktop-switch":
+        # `claude-relay watch` publishes that Claude Desktop is now on another account.
+        path = os.path.join(os.environ["CLAUDE_RELAY_HOME"], "state.json")
+        with open(path) as f:
+            state = json.load(f)
+        state["desktop"], state["desktop_at"] = os.environ.get("FAKE_DESKTOP", "b"), time.time()
+        with open(path, "w") as f:
+            json.dump(state, f)
+        hook("Stop", {"session_id": sid, "hook_event_name": "Stop"})
+        wait_for_term()
     elif SCENARIO == "below":
         statusline({"session_id": sid, "rate_limits": {"five_hour": {"used_percentage": 50, "resets_at": future}}})
         hook("Stop", {"session_id": sid, "hook_event_name": "Stop"})

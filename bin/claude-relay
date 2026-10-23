@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -77,6 +77,7 @@ DEFAULT_CONFIG = {
     "claude_bin": "claude",
     "remotes": [],                # SSH hosts where Claude Desktop runs remote sessions
     "notify": True,               # macOS notification when an account switch happens
+    "follow_desktop": True,       # `run` uses the account Claude Desktop uses (published by `watch`)
     "resume_prompt": ("This session stopped when its Claude account hit its usage limit, and claude-relay "
                       "moved it to another account. Background tasks and notifications from that time may "
                       "be lost, so check the real state first. Continue exactly where you left off."),
@@ -308,6 +309,20 @@ def choose_account(cfg, state, exclude=(), prefer=None):
     return None
 
 
+DESKTOP_FRESH = 600  # `watch` publishes every 30 s; an older value means it stopped (or the Mac sleeps)
+
+
+def desktop_choice(cfg, state):
+    """The account Claude Desktop uses (published by `watch`), when `run` follows it and can use it."""
+    name = state.get("desktop")
+    if time.time() - (state.get("desktop_at") or 0) > DESKTOP_FRESH:
+        return None
+    acc = find_account(cfg, name) if cfg.get("follow_desktop", True) else None
+    if acc and account_block(name, state, cfg["threshold"]) is None and token_get(name, acc.get("store", "file")):
+        return name
+    return None
+
+
 def fmt_time(epoch):
     if not epoch:
         return "unknown"
@@ -446,8 +461,12 @@ def cmd_use(args):
     def upd(st):
         st["active"] = args.name
         st["exhausted"].pop(args.name, None)
-    update_state(upd)
+    st = update_state(upd)
     say(f"Active account: {args.name}", "green")
+    follow = desktop_choice(cfg, st)
+    if follow and follow != args.name:
+        say(f"Note: `{PROG} run` follows Claude Desktop's account ({follow}). To keep {args.name}, run: "
+            f"{PROG} config follow_desktop false", "yellow")
     return 0
 
 
@@ -464,7 +483,7 @@ def cmd_reset(args):
 
 CONFIG_KEYS = {
     "threshold": int, "continue_prompt": str, "cooldown_minutes": int, "claude_bin": str, "notify": None,
-    "resume_prompt": str,
+    "follow_desktop": None, "resume_prompt": str,
 }
 
 
@@ -485,7 +504,7 @@ def cmd_config(args):
             v = int(args.value)
             if not 1 <= v <= 100:
                 die("threshold must be between 1 and 100 (100 = switch only when the limit is hit).")
-        elif args.key == "notify":
+        elif CONFIG_KEYS[args.key] is None:  # on/off settings
             v = args.value.lower() in ("1", "true", "yes", "on")
         else:
             v = CONFIG_KEYS[args.key](args.value)
@@ -725,7 +744,7 @@ def cmd_run(claude_args):
     try:
         while True:
             state = load_state()
-            current = choose_account(cfg, state, exclude=tried, prefer=current)
+            current = choose_account(cfg, state, exclude=tried, prefer=current or desktop_choice(cfg, state))
             if current is None:
                 say(f"{PROG}: no account is available right now.", "red", err=True)
                 print_availability(cfg, state)
@@ -800,7 +819,8 @@ def cmd_run(claude_args):
                 say(f"{PROG}: switching accounts but the session id is unknown; starting fresh.", "yellow", err=True)
             prompt = cfg["continue_prompt"] if switch.get("mid_turn") else None
             tried = {old}
-            nxt = choose_account(cfg, load_state(), exclude=tried)
+            state = load_state()
+            nxt = choose_account(cfg, state, exclude=tried, prefer=desktop_choice(cfg, state))
             if nxt is None:
                 say(f"{PROG}: '{old}' {switch.get('reason', 'reached its limit')} and no other account is "
                     "available.", "red", err=True)
@@ -1032,14 +1052,19 @@ def internal_hook(event):
     if event == "session-start":
         update_run(run_id, remember)
     elif event == "stop":
-        # An account marked exhausted by `watch` or by another machine also switches after this turn.
-        mark = load_state()["exhausted"].get(account) if account else None
+        # Also switch after this turn when `watch` or another machine marked this account exhausted,
+        # or when Claude Desktop now uses another account.
+        state = load_state()
+        mark = state["exhausted"].get(account) if account else None
         marked = (exhausted_until(mark) or 0) > time.time()
+        follow = desktop_choice(load_config(), state) if state.get("desktop") not in (None, account) else None
 
         def upd(r):
             remember(r)
             if marked and not r.get("pending"):
                 r["pending"] = (mark.get("reason") if isinstance(mark, dict) else None) or "hit its limit"
+            elif follow and account and follow != account and not r.get("pending"):
+                r["pending"] = "is not the account Claude Desktop uses"
             if r.get("pending") and not r.get("request"):
                 r["request"] = {"session_id": r.get("session_id"), "reason": r["pending"], "mid_turn": False}
         update_run(run_id, upd)
@@ -1389,7 +1414,7 @@ def restart_remote_helpers(hosts, dry_run):
             say(f"Would restart Claude Desktop's helpers on {host}.", "yellow")
             continue
         try:
-            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote_cmd],
+            r = subprocess.run(ssh_command(host) + [remote_cmd],
                                capture_output=True, text=True, timeout=30)
             if r.returncode == 0:
                 say(f"Restarted Claude Desktop's helpers on {host}.", "green")
@@ -1627,6 +1652,8 @@ def internal_sync(payload):
         merge_exhausted(st["exhausted"], p.get("exhausted"))
         if p.get("active") and find_account(cfg, p["active"]):
             st["active"] = p["active"]
+        if p.get("desktop"):
+            st["desktop"], st["desktop_at"] = p["desktop"], time.time()
     st = update_state(upd)
     out = scan_transcripts(DEFAULT_PROJECTS, float(p["since"]), p.get("check") or []) if "since" in p else {}
     out["exhausted"] = st["exhausted"]
@@ -1637,15 +1664,23 @@ def internal_sync(payload):
 _OWN_SCRIPT = []
 
 
-def remote_sync(host, payload):
-    """(reply, None) from `_sync` on `host`, or (None, why it failed). The host needs only python3."""
+def own_script():
+    """This script's source, read once: sent to SSH hosts by `watch` and `remote install`."""
     if not _OWN_SCRIPT:
         _OWN_SCRIPT.append(Path(__file__).read_text(encoding="utf-8"))
-    script = _OWN_SCRIPT[0]
+    return _OWN_SCRIPT[0]
+
+
+def ssh_command(host):
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host]
+
+
+def remote_sync(host, payload):
+    """(reply, None) from `_sync` on `host`, or (None, why it failed). The host needs only python3."""
     command = "python3 - _sync " + shlex.quote(json.dumps(payload, separators=(",", ":")))
     try:
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
-                           input=script, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(ssh_command(host) + [command], input=own_script(), capture_output=True, text=True,
+                           timeout=120)
     except Exception as e:
         return None, str(e)
     if r.returncode != 0:
@@ -1772,6 +1807,8 @@ def watch_pass(cfg):
                    "check": check.get(host, [])}
         if active:
             payload["active"] = active
+        if account:
+            payload["desktop"] = desktop_key(cfg, account)  # `run` on the host follows it
         reply, err = remote_sync(host, payload)
         if reply is None:
             wsay(f"Could not reach {host} ({err}).", "yellow")
@@ -1878,6 +1915,8 @@ def watch_pass(cfg):
         merge_exhausted(s["exhausted"], marks)
         if active and find_account(cfg, active):
             s["active"] = active
+        if account:  # `run` here follows it
+            s["desktop"], s["desktop_at"] = desktop_key(cfg, account), time.time()
         s["watch"] = w
     update_state(upd)
     return 0
@@ -1973,6 +2012,62 @@ def cmd_remote(args):
     return 0
 
 
+def cmd_remote_install(host):
+    """Copy claude-relay to ~/.local/bin on `host` and give it this machine's account names and Claude
+    Desktop links, so `claude-relay run` there follows the same accounts. Tokens are not copied."""
+    cfg = load_config()
+    accounts = [{"name": a["name"], "desktop_account": a.get("desktop_account")} for a in cfg["accounts"]]
+    target = f"~/.local/bin/{PROG}"
+    steps = (
+        (f"mkdir -p ~/.local/bin && cat > {target}.tmp && chmod 755 {target}.tmp && mv {target}.tmp {target}",
+         own_script()),
+        (f"{target} _import", json.dumps({"accounts": accounts})),
+    )
+    for command, stdin in steps:
+        try:
+            r = subprocess.run(ssh_command(host) + [command], input=stdin, capture_output=True, text=True,
+                               timeout=120)
+        except Exception as e:
+            die(f"Could not reach {host}: {e}")
+        if r.returncode != 0:
+            err = (r.stderr or "").strip().splitlines()
+            die(f"Could not install on {host}: {err[-1] if err else f'ssh exited with code {r.returncode}'}")
+    say(f"Installed {PROG} {__version__} on {host} ({target}) with {len(accounts)} account(s).", "green")
+    if accounts:
+        say(f"On {host}, add each account's token once (from `claude setup-token`):", "cyan")
+        for a in accounts:
+            say(f"  {PROG} accounts add {a['name']}", "white")
+    say(f"Then start Claude there with `{PROG} run`, or add to its shell: alias claude='{PROG} run'", "cyan")
+    return 0
+
+
+def internal_import():
+    """Run on an SSH host by `remote install`: take the account names and Claude Desktop links from
+    standard input. Tokens are added on the host with `accounts add`."""
+    data = read_stdin_json()
+    names = []
+    with Locked():
+        cfg = load_config()
+        for acc in data.get("accounts") or []:
+            name = acc.get("name") if isinstance(acc, dict) else None
+            if not (isinstance(name, str) and NAME_RE.match(name)):
+                continue
+            entry = find_account(cfg, name)
+            if entry is None:
+                entry = {"name": name, "store": default_store()}
+                cfg["accounts"].append(entry)
+            link = acc.get("desktop_account")
+            if link:
+                for other in cfg["accounts"]:
+                    if other is not entry and other.get("desktop_account") == link:
+                        other.pop("desktop_account")
+                entry["desktop_account"] = link
+            names.append(name)
+        save_config(cfg)
+    sys.stdout.write(json.dumps({"accounts": names}) + "\n")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2013,7 +2108,7 @@ def build_parser():
     conf.add_argument("value", nargs="?")
 
     rem = sub.add_parser("remote", help="SSH hosts that `desktop` restarts and `watch` keeps in sync")
-    rem.add_argument("action", choices=["add", "remove", "list"])
+    rem.add_argument("action", choices=["add", "remove", "list", "install"])
     rem.add_argument("host", nargs="?")
 
     wat = sub.add_parser("watch", help="follow usage limits and Claude Desktop account switches")
@@ -2054,6 +2149,8 @@ def main(argv=None):
         return internal_hook(argv[1])
     if argv and argv[0] == "_sync":
         return internal_sync(argv[1] if len(argv) > 1 else "{}")
+    if argv and argv[0] == "_import":
+        return internal_import()
 
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -2077,8 +2174,10 @@ def main(argv=None):
     if args.command == "config":
         return cmd_config(args)
     if args.command == "remote":
-        if args.action in ("add", "remove") and not args.host:
+        if args.action in ("add", "remove", "install") and not args.host:
             die(f"Usage: {PROG} remote {args.action} <ssh-host>")
+        if args.action == "install":
+            return cmd_remote_install(args.host)
         return cmd_remote(args)
     if args.command == "desktop":
         say(f"== {PROG} {__version__} · desktop ==", "white")

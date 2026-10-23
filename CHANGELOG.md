@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.0 — 2026-10-23
+
+- The terminal follows Claude Desktop: every pass, `watch` publishes the account Claude Desktop
+  uses (its `accounts link` name) on the Mac and on the `remote` hosts. `claude-relay run` starts on
+  it and a running session moves to it at the end of the turn, whether Claude Desktop switched by
+  hand or because of a limit. Exhausted accounts and accounts without a token on that machine are
+  skipped. New setting `follow_desktop` (default on).
+- New `claude-relay remote install HOST`: copies claude-relay to `~/.local/bin` on the host with the
+  account names and Desktop links. Tokens are not copied; add them on the host with `accounts add`.
+
 ## 2.1.1 — 2026-10-23
 
 - `claude-relay desktop` (and so `watch`) also brings Claude Desktop's recurring scheduled tasks

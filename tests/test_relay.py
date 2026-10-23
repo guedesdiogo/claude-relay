@@ -106,6 +106,18 @@ class AccountTests(unittest.TestCase):
         self.assertEqual(self.e.relay("config", "threshold", "90").returncode, 0)
         self.assertEqual(self.e.relay("config", "threshold").stdout.strip(), "90")
 
+    def test_link_desktop_account(self):
+        self.e.add("work", TOKEN_A)
+        self.assertEqual(self.e.relay("accounts", "link", "work", "uuid-1").returncode, 0)
+        self.assertEqual(self.e.relay("accounts", "link", "home", "uuid-2").returncode, 0)  # no token yet
+        self.assertEqual(self.e.relay("accounts", "link", "home", "uuid-1").returncode, 0)  # moves the link
+        cfg = json.loads((self.e.home_cfg / "config.json").read_text())
+        links = {a["name"]: a.get("desktop_account") for a in cfg["accounts"]}
+        self.assertEqual(links, {"work": None, "home": "uuid-1"})
+        out = self.e.relay("accounts", "list").stdout
+        self.assertIn("Desktop uuid-1", out)
+        self.assertIn("[token missing]", out)
+
     def test_remote_list(self):
         self.e.relay("remote", "add", "devbox")
         self.e.relay("remote", "add", "other")
@@ -192,6 +204,14 @@ class RunTests(unittest.TestCase):
         self.assertEqual(calls[1]["argv"], ["--resume", "sess-1", CONTINUE])
         self.assertGreater(self.e.state()["exhausted"]["a"]["until"], time.time())
         self.assertEqual(self.e.state()["exhausted"]["a"]["reason"], "hit its usage limit")
+
+    def test_switches_after_turn_when_marked_exhausted_elsewhere(self):
+        r = self.e.relay("run", "fix the bug", FAKE_SCENARIO="marked-elsewhere")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.e.calls()
+        self.assertEqual([c["account"] for c in calls], ["a", "b"])
+        self.assertEqual(calls[1]["argv"], ["--resume", "sess-1"])  # no prompt: the turn had ended
+        self.assertIn("'a' hit its weekly limit; switching to 'b'", r.stderr)
 
     def test_threshold_100_waits_for_the_limit(self):
         self.e.relay("config", "threshold", "100")

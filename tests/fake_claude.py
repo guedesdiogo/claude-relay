@@ -74,6 +74,16 @@ def main():
         log({"call": call, "statusline": out})
         hook("Stop", {"session_id": sid, "hook_event_name": "Stop"})
         wait_for_term()
+    elif SCENARIO == "marked-elsewhere":
+        # `claude-relay watch` (or another machine's sync) marks this account exhausted mid-run.
+        path = os.path.join(os.environ["CLAUDE_RELAY_HOME"], "state.json")
+        with open(path) as f:
+            state = json.load(f)
+        state["exhausted"][os.environ["CLAUDE_RELAY_ACCOUNT"]] = {"until": future, "reason": "hit its weekly limit"}
+        with open(path, "w") as f:
+            json.dump(state, f)
+        hook("Stop", {"session_id": sid, "hook_event_name": "Stop"})
+        wait_for_term()
     elif SCENARIO == "below":
         statusline({"session_id": sid, "rate_limits": {"five_hour": {"used_percentage": 50, "resets_at": future}}})
         hook("Stop", {"session_id": sid, "hook_event_name": "Stop"})

@@ -13,7 +13,11 @@ Use several Claude subscriptions as one, without losing your sessions.
   claude-relay desktop [options]   After switching accounts in Claude Desktop (macOS):
                                    bring your Code-tab sessions to the new account and
                                    restart Claude Desktop's helpers on your SSH hosts.
-  claude-relay remote ...          Manage the SSH hosts used by `desktop`.
+  claude-relay remote ...          Manage the SSH hosts used by `desktop` and `watch`.
+  claude-relay watch               Watch for usage limits on this Mac and the SSH hosts: mark the
+                                   account exhausted everywhere, tell you to switch Claude
+                                   Desktop, then move the sessions once you have.
+  claude-relay service ...         Run `watch` in the background (launchd agent, macOS).
   claude-relay config ...          Show or change settings (threshold, continue prompt...).
 
 The `desktop` command is a macOS port of restore-code-tab-sessions.ps1 from
@@ -27,6 +31,7 @@ import argparse
 import getpass
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -38,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.0.2"
+__version__ = "2.1.0"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -59,7 +64,10 @@ STATE_FILE = RELAY_HOME / "state.json"
 LOCK_FILE = RELAY_HOME / ".lock"
 RUNS_DIR = RELAY_HOME / "runs"
 TOKENS_DIR = RELAY_HOME / "tokens"
+RESUME_FILE = RELAY_HOME / "resume.json"
+WATCH_LOG = RELAY_HOME / "watch.log"
 KEYCHAIN_SERVICE = "claude-relay"
+LAUNCH_LABEL = "io.github.guedesdiogo.claude-relay"
 
 DEFAULT_CONFIG = {
     "accounts": [],               # [{"name": "work", "store": "keychain"|"file"}]
@@ -69,6 +77,9 @@ DEFAULT_CONFIG = {
     "claude_bin": "claude",
     "remotes": [],                # SSH hosts where Claude Desktop runs remote sessions
     "notify": True,               # macOS notification when an account switch happens
+    "resume_prompt": ("This session stopped when its Claude account hit its usage limit, and claude-relay "
+                      "moved it to another account. Background tasks and notifications from that time may "
+                      "be lost, so check the real state first. Continue exactly where you left off."),
 }
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -249,6 +260,19 @@ def parse_token_text(text):
 WINDOWS = (("five_hour", "5h"), ("seven_day", "7d"))
 
 
+def exhausted_until(mark):
+    """Epoch until which an `exhausted` mark holds (older versions stored a bare number)."""
+    return mark.get("until") if isinstance(mark, dict) else mark
+
+
+def merge_exhausted(dst, src):
+    """Merge `exhausted` marks from another machine: for each account the later reset wins."""
+    for name, mark in (src or {}).items():
+        until = exhausted_until(mark)
+        if isinstance(until, (int, float)) and until > (exhausted_until(dst.get(name)) or 0):
+            dst[name] = mark if isinstance(mark, dict) else {"until": until, "reason": "hit its limit"}
+
+
 def account_block(name, state, threshold, now=None):
     """Return None if the account can be used, otherwise (reason, until_epoch_or_None)."""
     now = now or time.time()
@@ -369,8 +393,28 @@ def cmd_accounts_list(args):
         status = "available" if block is None else f"skipped until {fmt_time(block[1])} ({block[0]})"
         has_token = token_get(name, a.get("store", "file")) is not None
         token_note = "" if has_token else "  [token missing]"
-        say(f" {mark} {name:<16} {usage_summary(name, state):<22} {status}{token_note}",
+        desktop_note = f"  [Desktop {a['desktop_account']}]" if a.get("desktop_account") else ""
+        say(f" {mark} {name:<16} {usage_summary(name, state):<22} {status}{token_note}{desktop_note}",
             "white" if block is None else "yellow")
+    return 0
+
+
+def cmd_accounts_link(args):
+    """Name a Claude Desktop account, so `watch` can mark the right claude-relay account exhausted."""
+    if not NAME_RE.match(args.name):
+        die("Account names may use letters, digits, '.', '_' and '-' (max 64 characters).")
+    with Locked():
+        cfg = load_config()
+        for a in cfg["accounts"]:
+            if a.get("desktop_account") == args.desktop_account:
+                a.pop("desktop_account")
+        acc = find_account(cfg, args.name)
+        if acc is None:  # Desktop-only for now; `accounts add` stores its token later
+            acc = {"name": args.name, "store": default_store()}
+            cfg["accounts"].append(acc)
+        acc["desktop_account"] = args.desktop_account
+        save_config(cfg)
+    say(f"'{args.name}' is Claude Desktop account {args.desktop_account}.", "green")
     return 0
 
 
@@ -420,6 +464,7 @@ def cmd_reset(args):
 
 CONFIG_KEYS = {
     "threshold": int, "continue_prompt": str, "cooldown_minutes": int, "claude_bin": str, "notify": None,
+    "resume_prompt": str,
 }
 
 
@@ -851,10 +896,13 @@ def internal_statusline():
     return 0
 
 
+USAGE_LIMIT_RE = re.compile(r"hit your|usage limit|weekly limit|session limit")
+
+
 def looks_like_capacity_error(text):
     """A temporary 429 ("this may be a temporary capacity issue"), not the account's usage limit."""
     t = (text or "").lower().replace("rate_limit", "")
-    return "capacity" in t and not re.search(r"hit your|usage limit|weekly limit|session limit", t)
+    return "capacity" in t and not USAGE_LIMIT_RE.search(t)
 
 
 def transcript_tail(path, max_bytes=20000):
@@ -904,25 +952,66 @@ def handle_failure(run_id, account, sid, error, message):
     return True
 
 
+def transcript_entries(path, max_bytes=200000):
+    """The JSON entries in the last `max_bytes` of a transcript."""
+    out = []
+    for line in transcript_tail(path, max_bytes).splitlines():
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(o, dict):
+            out.append(o)
+    return out
+
+
+def entry_text(entry):
+    content = (entry.get("message") or {}).get("content")
+    return content if isinstance(content, str) else " ".join(
+        p.get("text", "") for p in content or [] if isinstance(p, dict))
+
+
 def last_api_error(transcript_path):
     """(error, message) if the transcript's last assistant entry is an API error, else None.
 
     Claude Code records failed turns as {"type": "assistant", "isApiErrorMessage": true,
     "error": "<type>", "message": {"content": [{"text": "..."}]}}."""
     last = None
-    for line in transcript_tail(transcript_path, 200000).splitlines():
-        try:
-            o = json.loads(line)
-        except Exception:
-            continue
-        if isinstance(o, dict) and o.get("type") == "assistant":
+    for o in transcript_entries(transcript_path):
+        if o.get("type") == "assistant":
             last = o
     if not last or not last.get("isApiErrorMessage"):
         return None
-    content = (last.get("message") or {}).get("content")
-    text = content if isinstance(content, str) else " ".join(
-        p.get("text", "") for p in content or [] if isinstance(p, dict))
-    return str(last.get("error") or ""), text
+    return str(last.get("error") or ""), entry_text(last)
+
+
+LIMIT_WINDOWS = {"seven_day": "weekly", "five_hour": "5-hour"}
+
+
+def limit_from_entry(entry):
+    """(resets_at, window) when a transcript entry is a turn that failed on the account's usage limit.
+
+    Claude Code (verified with 2.1.299) adds the details to the failed turn:
+    "quotaLimits": {"status": "rejected", "resetsAt": <epoch seconds>, "rateLimitType": "seven_day"},
+    also under "apiErrorParams": {"rate_limit_info": {...}}. Without them, only a 429 whose text
+    names the usage limit counts, with an unknown reset time."""
+    if not (isinstance(entry, dict) and entry.get("isApiErrorMessage") and entry.get("error") == "rate_limit"):
+        return None
+    info = entry.get("quotaLimits")
+    if not isinstance(info, dict):
+        params = entry.get("apiErrorParams")
+        info = params.get("rate_limit_info") if isinstance(params, dict) else None
+    info = info if isinstance(info, dict) else {}
+    if info.get("status") == "rejected":
+        return info.get("resetsAt"), info.get("rateLimitType")
+    text = entry_text(entry).lower()
+    if USAGE_LIMIT_RE.search(text) and not looks_like_capacity_error(text):
+        return None, None
+    return None
+
+
+def limit_reason(window):
+    return f"hit its {LIMIT_WINDOWS[window]} limit" if window in LIMIT_WINDOWS else "hit its usage limit"
 
 
 def internal_hook(event):
@@ -943,8 +1032,14 @@ def internal_hook(event):
     if event == "session-start":
         update_run(run_id, remember)
     elif event == "stop":
+        # An account marked exhausted by `watch` or by another machine also switches after this turn.
+        mark = load_state()["exhausted"].get(account) if account else None
+        marked = (exhausted_until(mark) or 0) > time.time()
+
         def upd(r):
             remember(r)
+            if marked and not r.get("pending"):
+                r["pending"] = (mark.get("reason") if isinstance(mark, dict) else None) or "hit its limit"
             if r.get("pending") and not r.get("request"):
                 r["request"] = {"session_id": r.get("session_id"), "reason": r["pending"], "mid_turn": False}
         update_run(run_id, upd)
@@ -1435,6 +1530,387 @@ def cmd_desktop(args):
 
 
 # ---------------------------------------------------------------------------
+# `claude-relay watch`: notice usage limits on this Mac and the SSH hosts, and follow account switches
+# ---------------------------------------------------------------------------
+WATCH_INTERVAL = 30   # seconds between passes
+QUIET_SECONDS = 60    # move the sessions only once no Desktop session has written for this long
+SCAN_OVERLAP = 60     # re-read this far before the previous pass; entries are de-duplicated by uuid
+RESTORE_RETRY = 300   # wait this long after a failed move before trying again
+RESTORE_ATTEMPTS = 3  # then stop asking Claude Desktop to quit, and say how to do it by hand
+
+
+def scan_transcripts(projects_root, since, check=()):
+    """What `watch` needs from one machine's transcripts:
+    - events: usage-limit errors in Claude Desktop sessions written since `since`;
+    - latest_write: when a Claude Desktop session last wrote (among transcripts changed since `since`);
+    - stopped: the `check` sessions whose last turn still ends on a usage-limit error."""
+    check = set(check)
+    events, stopped, latest = [], [], 0.0
+    paths = projects_root.glob("*/*.jsonl") if projects_root.is_dir() else []
+    for path in paths:
+        cli = path.stem
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < since and cli not in check:
+            continue
+        entries = transcript_entries(path, 400000)
+        if cli in check:
+            last = next((o for o in reversed(entries) if o.get("type") == "assistant"), None)
+            if last is not None and limit_from_entry(last):
+                stopped.append(cli)
+        if mtime < since:
+            continue
+        if next((o.get("entrypoint") for o in reversed(entries) if o.get("entrypoint")), None) == "claude-desktop":
+            latest = max(latest, mtime)
+        for o in entries:
+            if o.get("entrypoint") != "claude-desktop":
+                continue
+            limit = limit_from_entry(o)
+            ts = to_epoch_ms(o.get("timestamp"), 0) / 1000
+            if limit and ts >= since:
+                events.append({"uuid": o.get("uuid") or f"{cli}@{ts}", "cli": cli, "ts": ts,
+                               "until": limit[0], "window": limit[1]})
+    return {"events": events, "latest_write": latest, "stopped": stopped}
+
+
+def internal_sync(payload):
+    """Run on an SSH host by `watch`, which pipes this script to `python3 -`: take the Mac's
+    `exhausted` marks (and the account to prefer), then report this host's transcripts and marks."""
+    try:
+        p = json.loads(payload)
+    except Exception:
+        p = {}
+    cfg = load_config()
+
+    def upd(st):
+        merge_exhausted(st["exhausted"], p.get("exhausted"))
+        if p.get("active") and find_account(cfg, p["active"]):
+            st["active"] = p["active"]
+    st = update_state(upd)
+    out = scan_transcripts(DEFAULT_PROJECTS, float(p["since"]), p.get("check") or []) if "since" in p else {}
+    out["exhausted"] = st["exhausted"]
+    sys.stdout.write(json.dumps(out) + "\n")
+    return 0
+
+
+_OWN_SCRIPT = []
+
+
+def remote_sync(host, payload):
+    """(reply, None) from `_sync` on `host`, or (None, why it failed). The host needs only python3."""
+    if not _OWN_SCRIPT:
+        _OWN_SCRIPT.append(Path(__file__).read_text(encoding="utf-8"))
+    script = _OWN_SCRIPT[0]
+    command = "python3 - _sync " + shlex.quote(json.dumps(payload, separators=(",", ":")))
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, command],
+                           input=script, capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return None, str(e)
+    if r.returncode != 0:
+        err = (r.stderr or "").strip().splitlines()
+        return None, err[-1] if err else f"ssh exited with code {r.returncode}"
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1]), None
+    except Exception:
+        return None, "unexpected reply"
+
+
+def desktop_key(cfg, account):
+    """The claude-relay name linked to a Claude Desktop account (`accounts link`), else the account id."""
+    for a in cfg["accounts"]:
+        if a.get("desktop_account") == account:
+            return a["name"]
+    return account
+
+
+def desktop_account_at(history, ts):
+    """The Claude Desktop account signed in at `ts`, from `watch`'s history; None before it started."""
+    found = None
+    for since, account in history:
+        if since > ts:
+            break
+        found = account
+    return found
+
+
+def next_desktop_account(cfg, cards_root, current, exhausted, now):
+    candidates = [a["desktop_account"] for a in cfg["accounts"] if a.get("desktop_account")]
+    if cards_root.is_dir():
+        candidates += sorted(p.name for p in cards_root.iterdir() if p.is_dir())
+    for account in dict.fromkeys(candidates):
+        name = desktop_key(cfg, account)
+        if account != current and (exhausted_until(exhausted.get(name)) or 0) <= now:
+            return name
+    return None
+
+
+def write_resume_list(cfg, account, dest, pending):
+    """resume.json: the sessions to resume after moving them to `account` (card folder `dest`)."""
+    cards = {}
+    for f in dest.glob("local_*.json"):
+        o = load_json(f)
+        if isinstance(o, dict) and o.get("cliSessionId"):
+            cards[str(o["cliSessionId"]).lower()] = o
+    sessions = []
+    for p in pending:
+        card = cards.get(p["cli"].lower())
+        if card:
+            sessions.append({"sessionId": card.get("sessionId"), "cliSessionId": p["cli"], "title": card.get("title"),
+                             "host": p["host"], "stoppedAt": p["ts"]})
+    write_json(RESUME_FILE, {"created": time.time(), "account": desktop_key(cfg, account), "sessions": sessions})
+    return sessions
+
+
+RESUME_TASK = "claude-relay-resume"
+RESUME_WAVE = 10
+
+
+def register_resume_task(cfg, dest):
+    """Make Claude Desktop resume the sessions in resume.json as soon as it opens: a one-time scheduled
+    task that is already due, registered in the account's card folder while the app is closed.
+
+    Claude Desktop keeps each task's prompt in ~/.claude/scheduled-tasks/<id>/SKILL.md and, per
+    account, {"scheduledTasks": [{"id", "fireAt": <epoch ms>, "enabled", "filePath", "cwd", ...}]} in
+    scheduled-tasks.json (format observed in Claude Desktop, October 2026). The task runs in
+    RELAY_HOME so it reads resume.json without a permission prompt."""
+    skill = HOME / ".claude" / "scheduled-tasks" / RESUME_TASK / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(
+        "---\n"
+        f"name: {RESUME_TASK}\n"
+        "description: Resume the Claude Code sessions that stopped on a usage limit (written by claude-relay).\n"
+        "---\n\n"
+        "claude-relay moved this account's Code-tab sessions here after another account hit its usage limit.\n\n"
+        f"1. Read `resume.json` in the current folder ({RELAY_HOME}). Its `sessions` list has a `sessionId` "
+        "and a `title` for each session to resume.\n"
+        "2. Call `list_sessions` (limit 100) and leave out any of those sessions that is already running.\n"
+        "3. Send each remaining session this message with `SendMessage` (`to` = its sessionId), word for "
+        "word:\n\n"
+        f"   {cfg.get('resume_prompt') or DEFAULT_CONFIG['resume_prompt']}\n\n"
+        f"   Send at most {RESUME_WAVE} at a time; before the next {RESUME_WAVE}, call `list_sessions` again "
+        f"and wait until fewer than {RESUME_WAVE} of them are running.\n"
+        "4. Do nothing else: do not run commands, edit files or answer for the sessions. Finish with one line: "
+        "how many sessions you messaged and which ones you skipped.\n",
+        encoding="utf-8")
+    path = dest / "scheduled-tasks.json"
+    data = load_json(path)
+    data = data if isinstance(data, dict) else {}
+    tasks = [t for t in data.get("scheduledTasks") or [] if isinstance(t, dict) and t.get("id") != RESUME_TASK]
+    now_ms = int(time.time() * 1000)
+    tasks.append({"id": RESUME_TASK, "displayName": "claude-relay: resume sessions", "fireAt": now_ms,
+                  "enabled": True, "filePath": str(skill), "createdAt": now_ms, "cwd": str(RELAY_HOME)})
+    data["scheduledTasks"] = tasks
+    write_json(path, data, mode=0o644)
+
+
+def wsay(msg, color="gray"):
+    say(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}", color)
+
+
+def watch_pass(cfg):
+    now = time.time()
+    st = load_state()
+    w = dict(st.get("watch") or {})
+    account = read_desktop_account(DEFAULT_CARDS.parent)[0]
+    history = [h for h in w.get("history") or [] if isinstance(h, list) and len(h) == 2]
+    switched = bool(account) and (not history or history[-1][1] != account)
+    if switched:
+        history = (history + [[now, account]])[-20:]
+    active = desktop_key(cfg, account) if switched else None
+    since = dict(w.get("since") or {})
+    pending = [p for p in w.get("pending") or [] if isinstance(p, dict) and p.get("cli")]
+    check = {}
+    for p in pending:
+        check.setdefault(p["host"], []).append(p["cli"])
+
+    # SSH hosts first: Claude Desktop may keep a local copy of a remote session's transcript.
+    results, marks, unreachable = {}, dict(st["exhausted"]), []
+    for host in cfg.get("remotes") or []:
+        payload = {"since": max(0, (since.get(host) or now) - SCAN_OVERLAP), "exhausted": st["exhausted"],
+                   "check": check.get(host, [])}
+        if active:
+            payload["active"] = active
+        reply, err = remote_sync(host, payload)
+        if reply is None:
+            wsay(f"Could not reach {host} ({err}).", "yellow")
+            unreachable.append(host)
+            continue
+        results[host] = reply
+        since[host] = now
+        merge_exhausted(marks, reply.get("exhausted"))
+    results["local"] = scan_transcripts(DEFAULT_PROJECTS, max(0, (since.get("local") or now) - SCAN_OVERLAP),
+                                        check.get("local", []))
+    since["local"] = now
+
+    # Sessions still stopped on a limit stay pending; new limit errors add sessions and marks.
+    pending = [p for p in pending if p["host"] not in results or p["cli"] in results[p["host"]]["stopped"]]
+    seen = list(w.get("seen") or [])
+    seen_set, new_marks = set(seen), {}
+    for host, res in results.items():
+        for ev in res.get("events") or []:
+            if ev["uuid"] in seen_set:
+                continue
+            seen.append(ev["uuid"])
+            seen_set.add(ev["uuid"])
+            owner = desktop_account_at(history, ev["ts"])
+            if not owner:
+                continue  # before `watch` knew which account was signed in
+            if not any(p["host"] == host and p["cli"] == ev["cli"] for p in pending):
+                pending.append({"host": host, "cli": ev["cli"], "account": owner, "ts": ev["ts"]})
+            until = ev.get("until") or ev["ts"] + 60 * int(cfg.get("cooldown_minutes") or 30)
+            name = desktop_key(cfg, owner)
+            if until > now and until > (exhausted_until(marks.get(name)) or 0):
+                marks[name] = {"until": until, "reason": limit_reason(ev.get("window"))}
+                new_marks[name] = owner
+    for name, owner in new_marks.items():
+        mark = marks[name]
+        msg = f"{name} {mark['reason']} until {fmt_time(mark['until'])}."
+        wsay(msg, "yellow")
+        if owner == account:
+            nxt = next_desktop_account(cfg, DEFAULT_CARDS, account, marks, now)
+            notify(cfg, "claude-relay", msg + (f" Sign Claude Desktop in to {nxt}; claude-relay will move your "
+                                               "sessions." if nxt else " No other Claude Desktop account is free."))
+    if new_marks:  # let the hosts' `claude-relay run` switch now rather than on the next pass
+        for host in results:
+            if host != "local":
+                remote_sync(host, {"exhausted": marks})
+
+    # Claude Desktop is signed in to another account: move the sessions once it is quiet.
+    restored = w.get("restored")
+    if account and restored is None:
+        w["restored"] = account  # first pass: nothing to move
+    elif account and account != restored and w.get("gave_up") != account and now >= (w.get("retry_at") or 0):
+        name = desktop_key(cfg, account)
+        org = resolve_org(DEFAULT_CARDS, account, read_cli_account())
+        latest = max(r.get("latest_write") or 0 for r in results.values())
+        if not org:
+            wsay(f"Claude Desktop is signed in to {name}, which has no session folder yet. Open the Code tab "
+                 "in Claude Desktop.", "yellow")
+        elif unreachable:  # its sessions may still be writing
+            wsay(f"Claude Desktop is signed in to {name}; waiting to reach {', '.join(unreachable)} before "
+                 "moving the sessions.", "yellow")
+        elif now - latest < QUIET_SECONDS:
+            wsay(f"Claude Desktop is signed in to {name}; waiting until no session has written for "
+                 f"{QUIET_SECONDS} s to move the sessions.", "cyan")
+            if w.get("waiting_for") != account:
+                w["waiting_for"] = account
+                notify(cfg, "claude-relay", f"Claude Desktop is signed in to {name}. Sessions move as soon as "
+                                            "none has written for a minute.")
+        else:
+            wsay(f"Claude Desktop is signed in to {name}: moving the sessions.", "white")
+            try:
+                rc = cmd_desktop(build_parser().parse_args(["desktop", "--quit", "--existing-cards-only"]))
+            except Exception as e:
+                wsay(f"Moving the sessions failed: {e!r}", "red")
+                rc = 1
+            if rc == 0:
+                stopped = {(h, c) for h, r in results.items() for c in r["stopped"]}
+                to_resume = [p for p in pending if p["account"] != account and (p["host"], p["cli"]) in stopped]
+                sessions = write_resume_list(cfg, account, DEFAULT_CARDS / account / org, to_resume)
+                if sessions:  # while the app is still closed, so it runs the task as it opens
+                    register_resume_task(cfg, DEFAULT_CARDS / account / org)
+                open_desktop()
+                pending = [p for p in pending if p not in to_resume]
+                w["restored"] = account
+                for k in ("waiting_for", "failures", "retry_at"):
+                    w.pop(k, None)
+                msg = f"Sessions moved to {name}; {len(sessions)} session(s) stopped on the limit."
+                wsay(f"{msg} List: {RESUME_FILE}", "green")
+                notify(cfg, "claude-relay", msg)
+            else:
+                open_desktop()  # do not leave the app closed; if it never quit, this only brings it forward
+                w["failures"] = (w.get("failures") or 0) + 1
+                manual = (f"Quit Claude Desktop (Cmd+Q) and run in Terminal.app: "
+                          f"{PROG} desktop --existing-cards-only --reopen")
+                if w["failures"] >= RESTORE_ATTEMPTS:
+                    w["gave_up"] = account  # until Claude Desktop is signed in to another account
+                    wsay(f"Could not move the sessions after {RESTORE_ATTEMPTS} tries. {manual}", "red")
+                    notify(cfg, "claude-relay", f"Could not move the sessions to {name}. {manual}")
+                else:
+                    w["retry_at"] = now + RESTORE_RETRY
+                    wsay(f"Could not move the sessions; trying again in {RESTORE_RETRY // 60} min.", "yellow")
+
+    w.update(history=history, since=since, pending=pending, seen=seen[-500:])
+
+    def upd(s):
+        merge_exhausted(s["exhausted"], marks)
+        if active and find_account(cfg, active):
+            s["active"] = active
+        s["watch"] = w
+    update_state(upd)
+    return 0
+
+
+def cmd_watch(args):
+    if args.once:
+        return watch_pass(load_config())
+    wsay(f"{PROG} {__version__} watching every {args.interval} s.", "white")
+    while True:
+        try:
+            watch_pass(load_config())
+        except Exception as e:  # keep watching; one bad pass must not stop the agent
+            wsay(f"Pass failed: {e!r}", "red")
+        time.sleep(args.interval)
+
+
+# ---------------------------------------------------------------------------
+# `claude-relay service`: run `watch` as a launchd agent (macOS)
+# ---------------------------------------------------------------------------
+def launch_agent_plist():
+    return HOME / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist"
+
+
+def watch_program():
+    """How launchd starts `watch`: the `claude-relay` on PATH when it is this script (a Homebrew
+    upgrade keeps that path working), else this Python with this file."""
+    me = os.path.realpath(__file__)
+    found = shutil.which(PROG)
+    if found and os.path.realpath(found) == me:
+        return [found, "watch"]
+    return [sys.executable, me, "watch"]
+
+
+def cmd_service(args):
+    if not IS_MAC:
+        say("`service` runs `watch` as a launchd agent on the Mac. SSH hosts need nothing running: the "
+            "Mac's `watch` reads and updates them over SSH.", "yellow")
+        return 1
+    plist = launch_agent_plist()
+    domain = f"gui/{os.getuid()}"
+    if args.action == "install":
+        RELAY_HOME.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["launchctl", "bootout", f"{domain}/{LAUNCH_LABEL}"], capture_output=True)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        with open(plist, "wb") as f:
+            plistlib.dump({
+                "Label": LAUNCH_LABEL, "ProgramArguments": watch_program(), "RunAtLoad": True, "KeepAlive": True,
+                "ProcessType": "Background", "StandardOutPath": str(WATCH_LOG), "StandardErrorPath": str(WATCH_LOG),
+                "EnvironmentVariables": {"PATH": os.environ.get("PATH") or "/usr/bin:/bin:/usr/sbin:/sbin"},
+            }, f)
+        r = subprocess.run(["launchctl", "bootstrap", domain, str(plist)], capture_output=True, text=True)
+        if r.returncode != 0:
+            say(f"launchctl could not start {plist}: {(r.stderr or '').strip()}", "red")
+            return 1
+        say(f"`{PROG} watch` now runs in the background and at login. Log: {WATCH_LOG}", "green")
+    elif args.action == "uninstall":
+        subprocess.run(["launchctl", "bootout", f"{domain}/{LAUNCH_LABEL}"], capture_output=True)
+        if plist.exists():
+            plist.unlink()
+        say(f"Stopped and removed `{PROG} watch` ({plist}).", "green")
+    else:
+        r = subprocess.run(["launchctl", "print", f"{domain}/{LAUNCH_LABEL}"], capture_output=True, text=True)
+        say(f"`{PROG} watch` is {'running' if r.returncode == 0 else 'not running'} ({plist}).",
+            "green" if r.returncode == 0 else "yellow")
+        if WATCH_LOG.exists():
+            for line in WATCH_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-10:]:
+                say(f"  {line}", "gray")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # `claude-relay remote`
 # ---------------------------------------------------------------------------
 def cmd_remote(args):
@@ -1483,6 +1959,9 @@ def build_parser():
     accsub.add_parser("list", help="show accounts, usage and availability")
     a_rm = accsub.add_parser("remove", help="forget an account and delete its token")
     a_rm.add_argument("name")
+    a_link = accsub.add_parser("link", help="name a Claude Desktop account (see `desktop --list`)")
+    a_link.add_argument("name")
+    a_link.add_argument("desktop_account", metavar="DESKTOP_ACCOUNT_ID")
 
     sub.add_parser("status", help="same as `accounts list`")
     use = sub.add_parser("use", help="make an account the first choice")
@@ -1494,9 +1973,17 @@ def build_parser():
     conf.add_argument("key", nargs="?")
     conf.add_argument("value", nargs="?")
 
-    rem = sub.add_parser("remote", help="SSH hosts whose Claude Desktop helpers `desktop` restarts")
+    rem = sub.add_parser("remote", help="SSH hosts that `desktop` restarts and `watch` keeps in sync")
     rem.add_argument("action", choices=["add", "remove", "list"])
     rem.add_argument("host", nargs="?")
+
+    wat = sub.add_parser("watch", help="follow usage limits and Claude Desktop account switches")
+    wat.add_argument("--once", action="store_true", help="run one pass and exit")
+    wat.add_argument("--interval", type=int, default=WATCH_INTERVAL, metavar="SECONDS",
+                     help=f"seconds between passes (default {WATCH_INTERVAL})")
+
+    svc = sub.add_parser("service", help="run `watch` in the background (launchd agent, macOS)")
+    svc.add_argument("action", choices=["install", "uninstall", "status"])
 
     d = sub.add_parser("desktop", help="move Code-tab sessions to the account Claude Desktop is signed into")
     d.add_argument("--list", action="store_true", help="show account folders and card counts; changes nothing")
@@ -1526,6 +2013,8 @@ def main(argv=None):
         return internal_statusline()
     if argv and argv[0] == "_hook" and len(argv) > 1:
         return internal_hook(argv[1])
+    if argv and argv[0] == "_sync":
+        return internal_sync(argv[1] if len(argv) > 1 else "{}")
 
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -1537,6 +2026,8 @@ def main(argv=None):
             return cmd_accounts_add(args)
         if args.action == "remove":
             return cmd_accounts_remove(args)
+        if args.action == "link":
+            return cmd_accounts_link(args)
         return cmd_accounts_list(args)
     if args.command == "status":
         return cmd_accounts_list(args)
@@ -1553,6 +2044,10 @@ def main(argv=None):
     if args.command == "desktop":
         say(f"== {PROG} {__version__} · desktop ==", "white")
         return cmd_desktop(args)
+    if args.command == "watch":
+        return cmd_watch(args)
+    if args.command == "service":
+        return cmd_service(args)
     ap.print_help()
     return 1
 

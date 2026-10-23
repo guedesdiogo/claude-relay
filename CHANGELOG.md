@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.1.0 — 2026-10-23
+
+- New `claude-relay watch`: every 30 s it reads new transcript lines on the Mac and, over SSH, on
+  the `remote` hosts (the script is piped to `python3 -`, so hosts need nothing installed). When a
+  Claude Desktop session hits its usage limit it marks the account exhausted until the reset time
+  from the transcript (`quotaLimits.resetsAt`), on every machine, and sends a notification naming
+  the next account to sign in to. Once Claude Desktop is signed in to another account and no
+  session has written for a minute, it quits the app, moves the sessions, restarts the hosts'
+  helpers and reopens the app. The sessions that stopped on the limit are listed in `resume.json`
+  and resumed by a one-time Claude Desktop scheduled task that `watch` registers, already due,
+  before reopening the app (message: new setting `resume_prompt`).
+- New `claude-relay service install | uninstall | status`: runs `watch` as a launchd agent.
+- New `claude-relay accounts link NAME ACCOUNT_ID`: names a Claude Desktop account, so `watch`
+  marks the claude-relay account of the same name.
+- `claude-relay run` switches at the end of the turn when its account is marked exhausted by
+  `watch` or by another machine.
+
 ## 2.0.2 — 2026-10-17
 
 - `claude-relay desktop` no longer copies sessions when it cannot check whether Claude Desktop is

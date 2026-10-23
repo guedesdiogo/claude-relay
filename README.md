@@ -13,6 +13,9 @@
 - **In Claude Desktop**, `claude-relay desktop` brings your Code-tab sessions along when you switch
   accounts, and restarts Claude Desktop's helpers on your SSH servers so remote sessions use the
   new account too.
+- **In the background**, `claude-relay watch` notices when an account hits its limit, on your Mac
+  and on your SSH servers, marks it everywhere, tells you to switch Claude Desktop, and moves your
+  sessions as soon as you have. Signing Claude Desktop in is the only step left to you.
 
 Everything stays in one conversation history: sessions are files on disk that belong to no
 account, so you can go from account A to B and back as often as you like.
@@ -30,6 +33,7 @@ account, so you can go from account A to B and back as often as you like.
 - [Install](#install)
 - [Terminal: automatic account failover](#terminal-automatic-account-failover)
 - [Claude Desktop: switching accounts](#claude-desktop-switching-accounts)
+- [Automatic switching: watch](#automatic-switching-watch)
 - [SSH servers](#ssh-servers)
 - [Commands](#commands)
 - [Settings](#settings)
@@ -174,6 +178,52 @@ VS Code to appear in the app. Run `claude-relay desktop --dry-run` first to see 
 
 ---
 
+## Automatic switching: watch
+
+`claude-relay watch` runs in the background on your Mac and does the switching work for you:
+
+1. Every 30 s it reads new transcript lines on the Mac and, over SSH, on the hosts you added with
+   `claude-relay remote add`. A Claude Desktop session that hits its usage limit leaves the reset
+   time in its transcript.
+2. It marks that account as exhausted until then, on the Mac and on every host, so
+   `claude-relay run` skips it everywhere. A `claude-relay run` already on that account switches
+   at the end of its current turn.
+3. It sends a notification: *"work hit its weekly limit until Thu 22 Oct 17:00. Sign Claude Desktop
+   in to home."*
+4. When Claude Desktop is signed in to another account and no session has written for a minute, it
+   quits the app, moves the sessions, restarts the helpers on your hosts and reopens the app.
+5. It resumes the sessions that stopped on the limit. Before reopening the app, it lists them in
+   `~/.config/claude-relay/resume.json` and registers a one-time Claude Desktop scheduled task,
+   already due, so the app runs it as it opens. The task sends each session `resume_prompt`, 10 at a
+   time. The first run may ask you to approve sending messages; allow it always.
+
+**What you still do:**
+
+| When | What |
+| ---- | ---- |
+| Each switch | Sign Claude Desktop in to the account the notification names, and open the Code tab. |
+| Once per account | `claude-relay accounts link NAME ACCOUNT_ID` (ids from `claude-relay desktop --list`). |
+| Once per account per year | `claude setup-token` and `claude-relay accounts add NAME` on each machine where you use `claude-relay run`. |
+| Once | `claude-relay service install` (starts `watch` now and at every login). |
+
+```bash
+claude-relay desktop --list                  # account ids
+claude-relay accounts link work <id-1>       # name them
+claude-relay accounts link home <id-2>
+claude-relay remote add my-server
+claude-relay service install
+claude-relay service status                  # running? last lines of the log
+```
+
+SSH hosts need nothing running and, for `watch`, nothing installed: the Mac sends the script to
+`python3 -` over SSH. Install claude-relay on a host only to use `claude-relay run` there.
+
+Errors from before `watch` started are ignored: it only knows which account they belong to from
+the moment it sees Claude Desktop signed in. Rotating accounts automatically is exactly what
+automated abuse systems look for; see the note at the top.
+
+---
+
 ## SSH servers
 
 There are two separate things, depending on how you use the server.
@@ -192,8 +242,9 @@ claude-relay remote add my-server    # a host name that works with plain `ssh my
 ```
 
 From then on, `claude-relay desktop` stops those helpers on each switch (Claude Desktop starts new
-ones with the current account). It needs key-based SSH login (no password prompt). Running
-sessions on that host are interrupted, so let replies finish before switching.
+ones with the current account), and `claude-relay watch` keeps the host's exhausted accounts in
+sync with the Mac. It needs key-based SSH login (no password prompt). Running sessions on that host
+are interrupted, so let replies finish before switching (`watch` waits for that on its own).
 
 ---
 
@@ -205,11 +256,14 @@ sessions on that host are interrupted, so let replies finish before switching.
 | `claude-relay accounts add NAME` | Store the token for an account (`--token-file PATH` to read it from a file). |
 | `claude-relay accounts list` / `status` | Accounts, recorded usage and availability. `*` marks the first choice. |
 | `claude-relay accounts remove NAME` | Forget an account and delete its token. |
+| `claude-relay accounts link NAME ACCOUNT_ID` | Name a Claude Desktop account, so `watch` marks and names it. |
 | `claude-relay use NAME` | Make an account the first choice. |
 | `claude-relay reset [NAME]` | Forget recorded usage, so skipped accounts are tried again. |
 | `claude-relay config [KEY [VALUE]]` | Show or change settings. |
-| `claude-relay remote add/remove/list HOST` | SSH hosts whose Claude Desktop helpers `desktop` restarts. |
+| `claude-relay remote add/remove/list HOST` | SSH hosts that `desktop` restarts and `watch` keeps in sync. |
 | `claude-relay desktop [options]` | Move Code-tab sessions to the account Claude Desktop is signed into. |
+| `claude-relay watch [--once] [--interval S]` | Follow usage limits and Claude Desktop account switches (see above). |
+| `claude-relay service install/uninstall/status` | Run `watch` as a launchd agent (macOS). Log: `~/.config/claude-relay/watch.log`. |
 
 `claude-relay desktop` options:
 
@@ -237,6 +291,7 @@ sessions on that host are interrupted, so let replies finish before switching.
 | `cooldown_minutes` | `30` | How long to skip an account that hit its limit when its reset time is unknown. |
 | `claude_bin` | `claude` | The Claude Code command to start. |
 | `notify` | `true` | macOS notification when an account switch happens. |
+| `resume_prompt` | *(see `config`)* | What `watch`'s resume task sends to each session that stopped on the limit. |
 
 Files live in `~/.config/claude-relay/` (or `$XDG_CONFIG_HOME/claude-relay`, or
 `$CLAUDE_RELAY_HOME`).
@@ -268,6 +323,13 @@ account from Claude Desktop's own config (`lastKnownAccountUuid`; Claude Desktop
 `~/.claude.json`), backs up the card folder, copies cards from other accounts, updates cards whose
 copy elsewhere has newer activity, and optionally creates cards for CLI / VS Code transcripts.
 Remote helpers live in `~/.claude/remote/` on each SSH host.
+
+**`watch`** looks for turns that failed on the usage limit: transcript entries with
+`"entrypoint": "claude-desktop"`, `"error": "rate_limit"` and `"quotaLimits": {"status": "rejected",
+"resetsAt": …}` (verified with Claude Code 2.1.299). Temporary capacity errors are ignored, and so
+are terminal sessions, which `claude-relay run` already handles. Each error belongs to the account
+Claude Desktop was signed in to at that moment. Marks are merged between machines (the later
+reset wins).
 
 The Claude Desktop file format was worked out by observation and may change in any app update.
 

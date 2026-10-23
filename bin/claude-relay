@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.2.2"
+__version__ = "2.3.0"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -1444,25 +1444,30 @@ def desktop_list(cards_root):
     return 0
 
 
-SYNC_FIELDS = ("lastActivityAt", "title", "titleSource")
+def card_version(card):
+    """How far a card's session has gone. Before 2.3.0 claude-relay copied lastActivityAt alone onto
+    the older copy, so two copies can share it; latestUserFrameAt then tells which one went on."""
+    return (card.get("lastActivityAt") or 0, card.get("latestUserFrameAt") or 0)
 
 
 def sync_card(src_card, dst_path, dry_run):
-    """Bring a card's last-activity time and title up to date from a newer copy in another account."""
+    """Bring a card up to date with the same session's card in another account. A newer copy replaces
+    it whole: the session went on there. With the same activity, an archived copy archives it, since
+    archiving changes no timestamp. Returns "updated", "archived" or None."""
     dst = load_json(dst_path)
     if not isinstance(dst, dict):
-        return False
-    if (src_card.get("lastActivityAt") or 0) <= (dst.get("lastActivityAt") or 0):
-        return False
-    changed = False
-    for k in SYNC_FIELDS:
-        if k in src_card and src_card[k] != dst.get(k):
-            dst[k] = src_card[k]
-            changed = True
-    if changed and not dry_run:
-        with open(dst_path, "w", encoding="utf-8") as fh:
-            json.dump(dst, fh, ensure_ascii=False, separators=(",", ":"))
-    return changed
+        return None
+    if card_version(src_card) > card_version(dst):
+        card, result = dict(src_card), "updated"
+        if dst.get("sessionId"):
+            card["sessionId"] = dst["sessionId"]
+    elif card_version(src_card) == card_version(dst) and src_card.get("isArchived") and not dst.get("isArchived"):
+        card, result = dict(dst, isArchived=True), "archived"
+    else:
+        return None
+    if not dry_run:
+        write_json(dst_path, card)  # 0600, like Claude Desktop's own cards
+    return result
 
 
 TASK_RUN_FIELDS = ("lastRunAt", "lastScheduledFor", "notifySessionId")
@@ -1589,34 +1594,39 @@ def cmd_desktop(args):
     def_chrome = tmpl.get("chromePermissionMode") or "default"
     def_mcp = tmpl.get("remoteMcpServersConfig") if tmpl else None
 
-    have = {}
+    # The destination's cards by cliSessionId and by sessionId. A card keeps its sessionId (and file
+    # name) in every account, while Claude Desktop can move it to a new transcript (cliSessionId).
+    have, by_id = {}, {}
     if dest.exists():
         for f in dest.glob("local_*.json"):
             o = load_json(f)
             if isinstance(o, dict) and o.get("cliSessionId"):
                 have[str(o["cliSessionId"]).lower()] = f
+                by_id[o.get("sessionId") or f.stem] = f
 
-    copied = synced = 0
-    for f in sorted(all_cards, key=lambda p: -((load_json(p) or {}).get("lastActivityAt") or 0)):
-        if same_dir(f.parent, dest):
-            continue
-        o = load_json(f)
-        if not isinstance(o, dict) or not o.get("cliSessionId"):
-            continue
-        key = str(o["cliSessionId"]).lower()
-        if key in have:
-            if have[key] is not None and sync_card(o, have[key], args.dry_run):
-                synced += 1
+    sources = [(f, load_json(f)) for f in all_cards if not same_dir(f.parent, dest)]
+    sources = [(f, o) for f, o in sources if isinstance(o, dict) and o.get("cliSessionId")]
+    copied = updated = archived = 0
+    for f, o in sorted(sources, key=lambda s: card_version(s[1]), reverse=True):  # newest copy first
+        key, sid = str(o["cliSessionId"]).lower(), o.get("sessionId") or f.stem
+        if sid in by_id or key in have:
+            match = by_id.get(sid) or have.get(key)
+            if match is not None:  # None: a card this dry run would copy
+                result = sync_card(o, match, args.dry_run)
+                updated += result == "updated"
+                archived += result == "archived"
+                have.setdefault(key, match)  # its transcript has a card now
             continue
         target = dest / f.name
         if not args.dry_run:
             if target.exists():
                 target = dest / f"local_{uuid.uuid4()}.json"
             shutil.copy2(f, target)
-        have[key] = target if not args.dry_run else None
+        have[key] = by_id[sid] = target if not args.dry_run else None
         copied += 1
     say(f"{'Would copy' if args.dry_run else 'Copied'} {copied} card(s) from other accounts"
-        f"{f'; updated {synced} with newer activity' if synced else ''}.", "green")
+        f"{f'; updated {updated} from a newer copy' if updated else ''}"
+        f"{f'; archived {archived} archived in another account' if archived else ''}.", "green")
 
     tasks = copy_scheduled_tasks(cards_root, dest, args.dry_run)
     if tasks is None:

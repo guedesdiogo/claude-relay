@@ -168,9 +168,15 @@ supported way to do that), but it handles everything else.
    ```
 
 It quits Claude Desktop, copies the session list and the recurring scheduled tasks from your
-other accounts into this one (and updates sessions you continued elsewhere), restarts Claude
-Desktop's helpers on the SSH hosts you configured, and opens the app again. Your sessions are
-there; continue any of them.
+other accounts into this one, restarts Claude Desktop's helpers on the SSH hosts you configured,
+and opens the app again. Your sessions are there; continue any of them.
+
+Sessions this account already had are brought up to date too:
+
+- A session you continued in another account takes that account's card whole: title, summary,
+  branch, pull requests, errors. This also applies when Claude Desktop moved it to a new
+  transcript.
+- A session you archived in another account, with no activity since, is archived here too.
 
 Useful shortcut:
 
@@ -188,7 +194,9 @@ and a task you delete in one account comes back from the others on the next swit
 in each account.
 
 **What stays per account:** usage limits, one-time scheduled tasks, claude.ai connectors and cloud
-sessions (Claude Code on the web). Archived status is per account too.
+sessions (Claude Code on the web). Unarchiving is per account too: a session you unarchive without
+continuing it is archived again from the other account on the next switch. Send it a message to
+keep it open everywhere.
 
 ---
 
@@ -353,8 +361,10 @@ account, in
 `~/Library/Application Support/Claude/claude-code-sessions/<accountId>/<orgId>/local_*.json`, each
 pointing at a transcript through `cliSessionId`. `claude-relay desktop` reads the signed-in
 account from Claude Desktop's own config (`lastKnownAccountUuid`; Claude Desktop does not update
-`~/.claude.json`), backs up the card folder, copies cards from other accounts, updates cards whose
-copy elsewhere has newer activity, and optionally creates cards for CLI / VS Code transcripts. It
+`~/.claude.json`), backs up the card folder, copies cards from other accounts, and optionally
+creates cards for CLI / VS Code transcripts. A card the account already has (same `sessionId`, or
+the same `cliSessionId`) is replaced by a copy with newer activity (`lastActivityAt`, then
+`latestUserFrameAt`), or archived when an equally recent copy is archived. It
 also adds the other accounts' recurring scheduled tasks to `scheduled-tasks.json` in the same
 folder, without the record of their last run there; the task prompts live in
 `~/.claude/scheduled-tasks/<id>/SKILL.md` and are shared by all accounts.

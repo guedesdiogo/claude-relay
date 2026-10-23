@@ -97,6 +97,17 @@ class AccountTests(unittest.TestCase):
         self.assertFalse(token_file.exists())
         self.assertNotIn("home", self.e.relay("accounts", "list").stdout)
 
+    def test_token_broken_over_lines_is_joined(self):
+        # 108 characters, as from `claude setup-token`, pasted from a narrow terminal.
+        token = "sk-ant-oat01-" + "Ab3_" * 23 + "x-y"
+        self.assertEqual(len(token), 108)
+        pasted = f"\n{token[:51]}\n  {token[51:73]}  \n{token[73:]}\n\nStore this token securely.\n"
+        self.assertEqual(self.e.relay("accounts", "add", "work", stdin=pasted).returncode, 0)
+        self.assertEqual((self.e.home_cfg / "tokens" / "work").read_text().strip(), token)
+        quoted = f"export CLAUDE_CODE_OAUTH_TOKEN='{token[:60]}\n{token[60:]}'\n"
+        self.assertEqual(relay.parse_token_text(quoted), token)
+        self.assertEqual(relay.parse_token_text(f"{token}\nStore this token securely.\n"), token)
+
     def test_rejects_garbage_token(self):
         r = self.e.relay("accounts", "add", "x", stdin="hello\n")
         self.assertNotEqual(r.returncode, 0)

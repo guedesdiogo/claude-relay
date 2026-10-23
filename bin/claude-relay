@@ -85,6 +85,7 @@ DEFAULT_CONFIG = {
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{20,}$")
+TOKEN_CHARS_RE = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 COLORS = {"gray": "90", "white": "97", "cyan": "36", "green": "32", "yellow": "33", "red": "31"}
@@ -244,13 +245,22 @@ def token_delete(name, store):
 
 
 def parse_token_text(text):
-    """Accept a raw token or a line like `export CLAUDE_CODE_OAUTH_TOKEN=...`."""
-    for line in (text or "").splitlines():
+    """Accept a raw token or a line like `export CLAUDE_CODE_OAUTH_TOKEN=...`. A token copied from a
+    narrow terminal arrives broken over lines: the lines after `sk-ant-...` that hold only token
+    characters are joined back to it, without the spaces around them."""
+    lines = (text or "").splitlines()
+    for i, line in enumerate(lines):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         m = re.search(r"CLAUDE_CODE_OAUTH_TOKEN\s*=\s*['\"]?([^'\"\s]+)", line)
         candidate = m.group(1) if m else line
+        if candidate.startswith("sk-ant-"):
+            for more in lines[i + 1:]:
+                more = more.strip().rstrip("'\"")  # the closing quote of an `export` line
+                if not TOKEN_CHARS_RE.match(more):
+                    break
+                candidate += more
         if TOKEN_RE.match(candidate):
             return candidate
     return None

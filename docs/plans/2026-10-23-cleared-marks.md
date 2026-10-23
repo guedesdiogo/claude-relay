@@ -32,3 +32,10 @@ does not lift a "token rejected" mark either, so the account stays skipped for a
 - Hosts with an older `claude-relay` installed keep working. Their `run` writes marks without
   `since`, and a later clear drops those marks. Run `claude-relay remote install HOST` again after
   upgrading.
+
+## Also in 2.2.2
+
+- A `reset` that runs during a `watch` pass is no longer undone. The pass ends by merging against
+  the state as it is then, and it respects the new `cleared` time.
+- `accounts add` joins a token pasted over several lines (`parse_token_text`). It took only the
+  first line, so a token copied from a narrow terminal was saved cut short and then rejected.

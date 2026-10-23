@@ -65,14 +65,17 @@ class WatchHome(FakeHome):
         return path
 
     def fake_remote_ssh(self):
-        """ssh that runs the command against the fake remote HOME; `pkill` is only logged."""
+        """ssh that runs the command against the fake remote HOME; `pkill` is only logged. A script in
+        `during-ssh` runs once on this machine first, as if typed while `watch` waits on ssh."""
         log = self.root / "ssh.log"
+        during = self.root / "during-ssh"
         script = self.bin / "ssh"
         script.write_text(
             "#!/bin/sh\n"
             "while [ $# -gt 0 ]; do case \"$1\" in -o) shift 2 ;; -*) shift ;; *) break ;; esac; done\n"
             "host=\"$1\"; shift\n"
             f"echo \"$host $*\" >> '{log}'\n"
+            f"if [ -e '{during}' ]; then sh '{during}' < /dev/null; rm -f '{during}'; fi\n"
             "case \"$*\" in\n"
             "  *pkill*) cat > /dev/null ;;\n"
             f"  *) HOME='{self.remote}' exec sh -c \"$*\" ;;\n"
@@ -240,6 +243,17 @@ class WatchTests(unittest.TestCase):
         self.assertIn("great", self.h.state(remote=True)["exhausted"])
         self.assertEqual(self.marks_after_two_passes(), ({}, {}))
         self.assertGreater(self.h.state(remote=True)["cleared"]["great"], self.now)
+
+    def test_reset_during_a_watch_pass_is_not_undone(self):
+        self.mark_on_both_machines("token rejected")
+        # `reset` runs while this pass waits on ssh, after it read the state it will write back.
+        (self.h.root / "during-ssh").write_text(f"'{sys.executable}' '{CLI}' reset great\n")
+        r = self.h.watch()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((self.h.root / "during-ssh").exists())
+        self.assertIn("great", self.h.state(remote=True)["exhausted"])  # the host got the old snapshot
+        self.assertNotIn("great", self.h.state()["exhausted"])
+        self.assertEqual(self.marks_after_two_passes(), ({}, {}))
 
     def test_use_on_the_mac_clears_the_mark_everywhere(self):
         self.mark_on_both_machines("hit its weekly limit")

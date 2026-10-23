@@ -7,7 +7,12 @@
   now records when it was made (`since`). Each machine records when each account's mark was last
   cleared (`cleared`), and `watch` and the SSH hosts exchange these times. A mark older than the
   account's last clear is dropped everywhere. A limit hit after the clear marks the account again.
-  A plain `reset` clears every configured account.
+  A plain `reset` clears every configured account. This also fixes a `reset` that ran during a
+  `watch` pass: the end of the pass wrote the mark back.
+- `claude-relay accounts add NAME` reads a token pasted over several lines. A token copied from a
+  narrow terminal arrives broken into lines, and only the first one was saved (51 of 108
+  characters), which Claude rejected. The lines after `sk-ant-...` that hold only token characters
+  are now joined back to it, without the spaces around them.
 - `claude-relay accounts add NAME` clears a "token rejected" mark for that account the same way.
   Before, the account stayed skipped for a day on every machine, even after its new token was
   saved. Usage-limit marks stay: a new token does not reset the limit.

@@ -37,14 +37,15 @@ class FakeHome:
             data = {"accounts": {"state": data}}
         (self.cards.parent / filename).write_text(json.dumps(data))
 
-    def add_card(self, account, org, cli_id, title="desk", last=None):
+    def add_card(self, account, org, cli_id, title="desk", last=None, **extra):
         d = self.cards / account / org
         d.mkdir(parents=True, exist_ok=True)
-        card = {"sessionId": f"local_{cli_id}", "cliSessionId": cli_id, "model": "m-test",
-                "effort": "medium", "title": title}
+        card = dict({"sessionId": f"local_{cli_id}", "cliSessionId": cli_id, "model": "m-test",
+                     "effort": "medium", "title": title}, **extra)
         if last is not None:
             card["lastActivityAt"] = last
-        (d / f"local_{cli_id}.json").write_text(json.dumps(card))
+        (d / f"{card['sessionId']}.json").write_text(json.dumps(card))
+        return card
 
     def add_tasks(self, account, org, tasks, **extra):
         """Claude Desktop's per-account scheduled-tasks.json (format observed in October 2026)."""
@@ -156,15 +157,129 @@ class DesktopTests(unittest.TestCase):
         ids = sorted(c["cliSessionId"] for c in self.h.cards_of("acctA", "orgA"))
         self.assertEqual(ids, ["S1", "S2", "S3"])
 
-    def test_newer_activity_is_synced_back(self):
-        self.h.add_card("acctA", "orgA", "S9", title="old title", last=100)
-        self.h.add_card("acctB", "orgB", "S9", title="renamed in B", last=200)
+    def card(self, account, org, session_id):
+        return next(c for c in self.h.cards_of(account, org) if c["sessionId"] == session_id)
+
+    def test_newer_copy_replaces_the_card(self):
+        # The session went on in B after it was archived in A: B's card is the one to keep, whole.
+        self.h.add_card("acctA", "orgA", "S9", title="old title", last=100, completedTurns=4, prs=[],
+                        error="usage limit", isArchived=True)
+        newer = self.h.add_card("acctB", "orgB", "S9", title="renamed in B", last=200, completedTurns=9,
+                                prs=[{"number": 7}], isArchived=False)
         self.h.desktop_login("acctA")
         r = self.h.run("--existing-cards-only")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        card = next(c for c in self.h.cards_of("acctA", "orgA") if c["cliSessionId"] == "S9")
-        self.assertEqual((card["title"], card["lastActivityAt"]), ("renamed in B", 200))
-        self.assertIn("updated 1 with newer activity", r.stdout)
+        self.assertEqual(self.card("acctA", "orgA", "local_S9"), newer)
+        self.assertEqual((self.h.cards / "acctA" / "orgA" / "local_S9.json").stat().st_mode & 0o777, 0o600)
+        self.assertIn("Copied 0 card(s) from other accounts; updated 1 from a newer copy.", r.stdout)
+        r = self.h.run("--existing-cards-only")
+        self.assertIn("Copied 0 card(s) from other accounts.", r.stdout)
+
+    def test_card_left_stale_by_older_versions_is_replaced(self):
+        # Before 2.3.0 only lastActivityAt and the title were copied, so both copies can show the same
+        # lastActivityAt; latestUserFrameAt still tells which one went on.
+        self.h.add_card("acctA", "orgA", "S9", last=200, latestUserFrameAt=100, completedTurns=4)
+        newer = self.h.add_card("acctB", "orgB", "S9", last=200, latestUserFrameAt=150, completedTurns=9)
+        self.h.desktop_login("acctA")
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.card("acctA", "orgA", "local_S9"), newer)
+
+    def test_archived_in_another_account_is_archived_here(self):
+        # Archiving changes no timestamp, so both copies show the same activity.
+        mine = self.h.add_card("acctA", "orgA", "S9", last=100, latestUserFrameAt=90, isArchived=False)
+        self.h.add_card("acctB", "orgB", "S9", title="other title", last=100, latestUserFrameAt=90,
+                        isArchived=True)
+        self.h.desktop_login("acctA")
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.card("acctA", "orgA", "local_S9"), dict(mine, isArchived=True))
+        self.assertIn("Copied 0 card(s) from other accounts; archived 1 archived in another account.",
+                      r.stdout)
+        r = self.h.run("--existing-cards-only")
+        self.assertIn("Copied 0 card(s) from other accounts.", r.stdout)
+
+    def test_newer_card_here_is_kept(self):
+        # The session went on here after the other account archived or renamed its older copy.
+        mine = self.h.add_card("acctA", "orgA", "S9", last=300, isArchived=False)
+        self.h.add_card("acctB", "orgB", "S9", title="renamed in B", last=200, isArchived=True)
+        self.h.desktop_login("acctA")
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.card("acctA", "orgA", "local_S9"), mine)
+        self.assertIn("Copied 0 card(s) from other accounts.", r.stdout)
+
+    def test_continuation_under_a_new_cli_session_replaces_the_card(self):
+        # Claude Desktop can move a card to a new transcript; the card's sessionId stays the same.
+        self.h.add_card("acctA", "orgA", "S9", sessionId="local_card", last=100)
+        newer = self.h.add_card("acctB", "orgB", "S10", sessionId="local_card", last=200,
+                                priorCliSessionIds=["S9"])
+        for cli in ("S9", "S10"):
+            self.h.add_transcript(cli, [{"type": "user", "cwd": "/Users/x/proj",
+                                         "timestamp": "2026-10-03T10:00:00Z", "message": {"content": cli}}])
+        self.h.desktop_login("acctA")
+        r = self.h.run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cards = self.h.cards_of("acctA", "orgA")
+        self.assertEqual(sorted(c["cliSessionId"] for c in cards), ["S1", "S10", "S2"])
+        self.assertEqual(self.card("acctA", "orgA", "local_card"), newer)
+        self.assertIn("updated 1 from a newer copy", r.stdout)
+
+    def test_archive_index_follows_the_cards(self):
+        # Claude Desktop also lists each account's archived cards in archived-sessions.idx (sorted).
+        index = self.h.cards / "acctA" / "orgA" / "archived-sessions.idx"
+        index.write_text(json.dumps({"v": 1, "archived": ["local_S0", "local_S8"]}))
+        self.h.add_card("acctA", "orgA", "S8", last=100, isArchived=True)  # continued in B since
+        self.h.add_card("acctB", "orgB", "S8", last=200, isArchived=False)
+        self.h.add_card("acctA", "orgA", "S9", last=100)
+        self.h.add_card("acctB", "orgB", "S9", last=100, isArchived=True)
+        self.h.add_card("acctB", "orgB", "S7", last=50, isArchived=True)  # new here
+        self.h.desktop_login("acctA")
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(index.read_text()), {"v": 1, "archived": ["local_S0", "local_S7", "local_S9"]})
+        self.assertEqual(index.stat().st_mode & 0o777, 0o600)
+
+    def test_archive_index_is_left_to_claude_desktop_when_missing_or_unreadable(self):
+        self.h.add_card("acctB", "orgB", "S9", isArchived=True)
+        self.h.desktop_login("acctA")
+        index = self.h.cards / "acctA" / "orgA" / "archived-sessions.idx"
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(index.exists())
+        index.write_text("{not json")
+        self.h.add_card("acctB", "orgB", "S8", isArchived=True)
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(index.read_text(), "{not json")
+
+    def test_session_deleted_here_is_not_copied_back(self):
+        # Deleting a session leaves deleted_<uuid> for its sessionId and deleted_<cliSessionId>.
+        here = self.h.cards / "acctA" / "orgA"
+        (here / "deleted_card1").write_text("1792094249469")
+        (here / "deleted_S10").write_text("1792094249469")
+        self.h.add_card("acctB", "orgB", "S9", sessionId="local_card1", last=500)
+        self.h.add_card("acctB", "orgB", "S10", sessionId="local_card2", last=500)
+        self.h.add_transcript("S10", [{"type": "user", "cwd": "/Users/x/proj",
+                                       "timestamp": "2026-10-03T10:00:00Z", "message": {"content": "hi"}}])
+        self.h.desktop_login("acctA")
+        r = self.h.run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sorted(c["cliSessionId"] for c in self.h.cards_of("acctA", "orgA")), ["S1", "S2"])
+        self.assertIn("Copied 0 card(s) from other accounts.", r.stdout)
+
+    def test_dry_run_counts_card_updates_without_writing(self):
+        self.h.add_card("acctA", "orgA", "S8", last=100)
+        self.h.add_card("acctB", "orgB", "S8", last=200)
+        self.h.add_card("acctA", "orgA", "S9", last=100)
+        self.h.add_card("acctB", "orgB", "S9", last=100, isArchived=True)
+        before = self.h.cards_of("acctA", "orgA")
+        self.h.desktop_login("acctA")
+        r = self.h.run("--existing-cards-only", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Would copy 0 card(s) from other accounts; updated 1 from a newer copy; "
+                      "archived 1 archived in another account.", r.stdout)
+        self.assertEqual(self.h.cards_of("acctA", "orgA"), before)
 
     def test_recurring_scheduled_tasks_follow_the_account(self):
         daily = {"id": "daily", "displayName": "Daily", "cronExpression": "30 8 * * *", "enabled": True,

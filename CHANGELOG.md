@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.3.0 — 2026-10-23
+
+- `claude-relay desktop` (and `watch` when it moves the sessions) now brings the sessions this
+  account already had up to date. Before, it only copied their last-activity time and title.
+  - **A session continued in another account takes that account's card whole:** summary, branch,
+    pull requests, error state, turns. Before, the rest of the card stayed as it was when you left.
+    Cards that earlier versions updated only in part are fixed as well. They share
+    `lastActivityAt` with the other copy, so `latestUserFrameAt` decides which copy is newer.
+  - **A session archived in another account is archived here** when neither copy has newer
+    activity. Archiving changes no timestamp, so before the archive never carried over, and
+    archived sessions came back on every switch.
+  - **A card is matched by its `sessionId`** as well as its `cliSessionId`. When Claude Desktop
+    had moved a session to a new transcript, the switch added a second card for it next to the old
+    one. Now it replaces the old card.
+  - The summary line says how many cards each rule changed: `updated N from a newer copy;
+    archived N archived in another account`.
+  - The account's `archived-sessions.idx`, the sorted list of archived cards that Claude Desktop
+    keeps next to them, is updated with the cards written: archived ones are added, and cards that a
+    newer copy left open are removed. A missing or unreadable index is left alone.
+- A session deleted in this account is no longer copied back from another account. Claude Desktop
+  leaves `deleted_<sessionId uuid>` and `deleted_<cliSessionId>` behind. The card copy and the
+  transcript scan now skip both ids.
+- A copy with newer activity always wins, so a session you continued after archiving it stays
+  open. A session you unarchive without continuing it is archived again from the other account.
+- After upgrading, fix the account Claude Desktop is signed in to now. `watch` moves sessions only
+  when the account changes. Quit Claude Desktop (Cmd+Q) and run in Terminal.app:
+  `claude-relay desktop --existing-cards-only --reopen`.
+
 ## 2.2.6 — 2026-10-23
 
 - When `watch` cannot write `resume.json`, the list of sessions stopped on a limit, it now finishes

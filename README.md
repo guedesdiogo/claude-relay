@@ -99,6 +99,10 @@ claude-relay accounts add personal
 claude-relay accounts list
 ```
 
+A narrow terminal may break the token over several lines when you copy it. Paste it as it is:
+claude-relay joins the lines back. The prompt, `pbpaste | claude-relay accounts add NAME` and
+`--token-file PATH` all accept a split token. A piece of a token is refused, and nothing is saved.
+
 On macOS tokens go into the **Keychain**; on Linux into `~/.config/claude-relay/tokens/` with
 permissions `600`. The first account you add is the one used first.
 

@@ -39,3 +39,7 @@ does not lift a "token rejected" mark either, so the account stays skipped for a
   the state as it is then, and it respects the new `cleared` time.
 - `accounts add` joins a token pasted over several lines (`parse_token_text`). It took only the
   first line, so a token copied from a narrow terminal was saved cut short and then rejected.
+  - The rule applies to the hidden prompt, a pipe and `--token-file` alike.
+  - The prompt replaces getpass: with echo off, it reads the lines that arrive within 0.2 s, so
+    the rest of the paste never reaches the shell.
+  - A result that does not start with `sk-ant-`, or has fewer than 100 characters, is refused.

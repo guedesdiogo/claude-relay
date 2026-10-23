@@ -86,6 +86,7 @@ DEFAULT_CONFIG = {
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{20,}$")
 TOKEN_CHARS_RE = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
+MIN_TOKEN_LENGTH = 100  # `claude setup-token` prints 108 characters; fewer means part of it
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 COLORS = {"gray": "90", "white": "97", "cyan": "36", "green": "32", "yellow": "33", "red": "31"}
@@ -266,6 +267,39 @@ def parse_token_text(text):
     return None
 
 
+PASTE_WAIT = 0.2  # seconds: the other lines of one paste arrive well within this
+
+
+def read_hidden(prompt):
+    """Read a pasted token from the terminal with echo off. getpass returns only the first line of
+    a token broken over lines, and leaves the rest for the shell, which runs it as commands. Here
+    the lines that follow within PASTE_WAIT are read too, still without echo, and what arrives after
+    that is discarded."""
+    try:
+        import select
+        import termios
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except (ImportError, OSError):
+        return getpass.getpass(prompt)
+    chunks = []
+    try:
+        old = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        new[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSAFLUSH, new)
+        try:
+            os.write(fd, prompt.encode())
+            chunks.append(os.read(fd, 4096))  # a terminal hands over one line per read
+            while chunks[-1] and select.select([fd], [], [], PASTE_WAIT)[0]:
+                chunks.append(os.read(fd, 4096))
+        finally:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, old)
+            os.write(fd, b"\n")
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
 # ---------------------------------------------------------------------------
 # Account availability
 # ---------------------------------------------------------------------------
@@ -408,9 +442,12 @@ def cmd_accounts_add(args):
     else:
         say(f"Paste the long-lived token for '{name}'. Create it with `claude setup-token` while signed in", "cyan")
         say("to that account in your browser. The token is hidden while you paste.", "cyan")
-        token = parse_token_text(getpass.getpass("Token: "))
+        token = parse_token_text(read_hidden("Token: "))
     if not token:
         die("That does not look like a token from `claude setup-token`.")
+    if not token.startswith("sk-ant-") or len(token) < MIN_TOKEN_LENGTH:
+        die(f"That is not a whole token from `claude setup-token` ({len(token)} characters; a token starts with "
+            f"sk-ant- and has about 108). Paste the whole token. Nothing was saved.")
     token_set(name, token, store)
 
     def upd(cfg):

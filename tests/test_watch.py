@@ -17,7 +17,7 @@ from test_relay import CLI, load_module
 
 relay = load_module()
 WEEKLY = "You've hit your weekly limit · resets 5pm (America/Sao_Paulo)"
-TOKEN_G = "sk-ant-oat01-" + "g" * 40
+TOKEN_G = "sk-ant-oat01-" + "g" * 95
 
 
 def iso(epoch):
@@ -324,7 +324,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.h.state(remote=True)["desktop"], "home")
 
     def test_remote_install_copies_the_script_and_the_account_names(self):
-        token = "sk-ant-oat01-" + "w" * 40
+        token = "sk-ant-oat01-" + "w" * 95
         token_file = self.h.root / "work.token"
         token_file.write_text(token + "\n")
         self.assertEqual(self.h.relay("accounts", "add", "work", "--token-file", str(token_file)).returncode, 0)

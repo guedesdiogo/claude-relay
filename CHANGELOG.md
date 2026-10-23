@@ -10,9 +10,16 @@
   A plain `reset` clears every configured account. This also fixes a `reset` that ran during a
   `watch` pass: the end of the pass wrote the mark back.
 - `claude-relay accounts add NAME` reads a token pasted over several lines. A token copied from a
-  narrow terminal arrives broken into lines, and only the first one was saved (51 of 108
-  characters), which Claude rejected. The lines after `sk-ant-...` that hold only token characters
-  are now joined back to it, without the spaces around them.
+  narrow terminal arrives broken into lines. Before, only the first line was saved (51 or 73 of
+  108 characters), and Claude rejected the token. The lines after `sk-ant-...` that hold only
+  token characters are now joined back to it, without the spaces around them.
+  - This applies to all three ways in: the hidden prompt, a pipe (`pbpaste | claude-relay
+    accounts add NAME`) and `--token-file`.
+  - The prompt no longer uses getpass, which returned only the first line and left the rest for
+    the shell to run as commands. It reads the lines that arrive within 0.2 s, still hidden, and
+    discards anything after them.
+  - `accounts add` refuses a token that does not start with `sk-ant-` or is shorter than 100
+    characters, and asks for the whole token. Before, it saved the piece.
 - `claude-relay accounts add NAME` clears a "token rejected" mark for that account the same way.
   Before, the account stayed skipped for a day on every machine, even after its new token was
   saved. Usage-limit marks stay: a new token does not reset the limit.

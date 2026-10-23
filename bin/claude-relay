@@ -1855,7 +1855,14 @@ def register_resume_task(cfg, dest):
     Claude Desktop keeps each task's prompt in ~/.claude/scheduled-tasks/<id>/SKILL.md and, per
     account, {"scheduledTasks": [{"id", "fireAt": <epoch ms>, "enabled", "filePath", "cwd", ...}]} in
     scheduled-tasks.json (format observed in Claude Desktop, October 2026). The task runs in
-    RELAY_HOME so it reads resume.json without a permission prompt."""
+    RELAY_HOME so it reads resume.json without a permission prompt. A scheduled-tasks.json that exists
+    but cannot be read is left alone, with a warning. Returns whether the task was added."""
+    path = dest / "scheduled-tasks.json"
+    data = load_json(path) if path.exists() else {}
+    if not isinstance(data, dict) or not isinstance(data.get("scheduledTasks") or [], list):
+        wsay(f"Could not read {path}, so the resume task was not added. Resume the sessions in {RESUME_FILE} "
+             "by hand.", "yellow")
+        return False
     skill = HOME / ".claude" / "scheduled-tasks" / RESUME_TASK / "SKILL.md"
     skill.parent.mkdir(parents=True, exist_ok=True)
     skill.write_text(
@@ -1875,15 +1882,13 @@ def register_resume_task(cfg, dest):
         "4. Do nothing else: do not run commands, edit files or answer for the sessions. Finish with one line: "
         "how many sessions you messaged and which ones you skipped.\n",
         encoding="utf-8")
-    path = dest / "scheduled-tasks.json"
-    data = load_json(path)
-    data = data if isinstance(data, dict) else {}
     tasks = [t for t in data.get("scheduledTasks") or [] if isinstance(t, dict) and t.get("id") != RESUME_TASK]
     now_ms = int(time.time() * 1000)
     tasks.append({"id": RESUME_TASK, "displayName": "claude-relay: resume sessions", "fireAt": now_ms,
                   "enabled": True, "filePath": str(skill), "createdAt": now_ms, "cwd": str(RELAY_HOME)})
     data["scheduledTasks"] = tasks
-    write_json(path, data, mode=0o644)
+    write_json(path, data)  # 0600, like Claude Desktop's own copy
+    return True
 
 
 def wsay(msg, color="gray"):
@@ -1995,15 +2000,20 @@ def watch_pass(cfg):
                 stopped = {(h, c) for h, r in results.items() for c in r["stopped"]}
                 to_resume = [p for p in pending if p["account"] != account and (p["host"], p["cli"]) in stopped]
                 sessions = write_resume_list(cfg, account, DEFAULT_CARDS / account / org, to_resume)
+                added = True
                 if sessions:  # while the app is still closed, so it runs the task as it opens
-                    register_resume_task(cfg, DEFAULT_CARDS / account / org)
+                    added = register_resume_task(cfg, DEFAULT_CARDS / account / org)
                 open_desktop()
                 pending = [p for p in pending if p not in to_resume]
                 w["restored"] = account
                 for k in ("waiting_for", "failures", "retry_at"):
                     w.pop(k, None)
                 msg = f"Sessions moved to {name}; {len(sessions)} session(s) stopped on the limit."
-                wsay(f"{msg} List: {RESUME_FILE}", "green")
+                if added:
+                    wsay(f"{msg} List: {RESUME_FILE}", "green")
+                else:  # they will not resume on their own
+                    msg += f" Resume them by hand: the list is in {RESUME_FILE}."
+                    wsay(msg, "yellow")
                 notify(cfg, "claude-relay", msg)
             else:
                 open_desktop()  # do not leave the app closed; if it never quit, this only brings it forward

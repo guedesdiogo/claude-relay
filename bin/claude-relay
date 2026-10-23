@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.2.4"
+__version__ = "2.2.5"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -1763,7 +1763,8 @@ def register_resume_task(cfg, dest):
     account, {"scheduledTasks": [{"id", "fireAt": <epoch ms>, "enabled", "filePath", "cwd", ...}]} in
     scheduled-tasks.json (format observed in Claude Desktop, October 2026). The task runs in
     RELAY_HOME so it reads resume.json without a permission prompt. A scheduled-tasks.json that exists
-    but cannot be read is left alone, with a warning. Returns whether the task was added."""
+    but cannot be read is left alone, with a warning; so is a write that fails. Returns whether the task
+    was added."""
     path = dest / "scheduled-tasks.json"
     data = load_json(path) if path.exists() else {}
     if not isinstance(data, dict) or not isinstance(data.get("scheduledTasks") or [], list):
@@ -1771,30 +1772,35 @@ def register_resume_task(cfg, dest):
              "by hand.", "yellow")
         return False
     skill = HOME / ".claude" / "scheduled-tasks" / RESUME_TASK / "SKILL.md"
-    skill.parent.mkdir(parents=True, exist_ok=True)
-    skill.write_text(
-        "---\n"
-        f"name: {RESUME_TASK}\n"
-        "description: Resume the Claude Code sessions that stopped on a usage limit (written by claude-relay).\n"
-        "---\n\n"
-        "claude-relay moved this account's Code-tab sessions here after another account hit its usage limit.\n\n"
-        f"1. Read `resume.json` in the current folder ({RELAY_HOME}). Its `sessions` list has a `sessionId` "
-        "and a `title` for each session to resume.\n"
-        "2. Call `list_sessions` (limit 100) and leave out any of those sessions that is already running.\n"
-        "3. Send each remaining session this message with `SendMessage` (`to` = its sessionId), word for "
-        "word:\n\n"
-        f"   {cfg.get('resume_prompt') or DEFAULT_CONFIG['resume_prompt']}\n\n"
-        f"   Send at most {RESUME_WAVE} at a time; before the next {RESUME_WAVE}, call `list_sessions` again "
-        f"and wait until fewer than {RESUME_WAVE} of them are running.\n"
-        "4. Do nothing else: do not run commands, edit files or answer for the sessions. Finish with one line: "
-        "how many sessions you messaged and which ones you skipped.\n",
-        encoding="utf-8")
-    tasks = [t for t in data.get("scheduledTasks") or [] if isinstance(t, dict) and t.get("id") != RESUME_TASK]
-    now_ms = int(time.time() * 1000)
-    tasks.append({"id": RESUME_TASK, "displayName": "claude-relay: resume sessions", "fireAt": now_ms,
-                  "enabled": True, "filePath": str(skill), "createdAt": now_ms, "cwd": str(RELAY_HOME)})
-    data["scheduledTasks"] = tasks
-    write_json(path, data)  # 0600, like Claude Desktop's own copy
+    try:  # the prompt first, so no task ever points at a missing file
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(
+            "---\n"
+            f"name: {RESUME_TASK}\n"
+            "description: Resume the Claude Code sessions that stopped on a usage limit (written by claude-relay).\n"
+            "---\n\n"
+            "claude-relay moved this account's Code-tab sessions here after another account hit its usage limit.\n\n"
+            f"1. Read `resume.json` in the current folder ({RELAY_HOME}). Its `sessions` list has a `sessionId` "
+            "and a `title` for each session to resume.\n"
+            "2. Call `list_sessions` (limit 100) and leave out any of those sessions that is already running.\n"
+            "3. Send each remaining session this message with `SendMessage` (`to` = its sessionId), word for "
+            "word:\n\n"
+            f"   {cfg.get('resume_prompt') or DEFAULT_CONFIG['resume_prompt']}\n\n"
+            f"   Send at most {RESUME_WAVE} at a time; before the next {RESUME_WAVE}, call `list_sessions` again "
+            f"and wait until fewer than {RESUME_WAVE} of them are running.\n"
+            "4. Do nothing else: do not run commands, edit files or answer for the sessions. Finish with one line: "
+            "how many sessions you messaged and which ones you skipped.\n",
+            encoding="utf-8")
+        tasks = [t for t in data.get("scheduledTasks") or [] if isinstance(t, dict) and t.get("id") != RESUME_TASK]
+        now_ms = int(time.time() * 1000)
+        tasks.append({"id": RESUME_TASK, "displayName": "claude-relay: resume sessions", "fireAt": now_ms,
+                      "enabled": True, "filePath": str(skill), "createdAt": now_ms, "cwd": str(RELAY_HOME)})
+        data["scheduledTasks"] = tasks
+        write_json(path, data)  # 0600, like Claude Desktop's own copy
+    except OSError as e:
+        wsay(f"Could not write the resume task ({e}), so it was not added. Resume the sessions in "
+             f"{RESUME_FILE} by hand.", "yellow")
+        return False
     return True
 
 

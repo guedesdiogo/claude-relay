@@ -308,6 +308,18 @@ class WatchTests(unittest.TestCase):
     def test_scheduled_tasks_that_are_not_a_list_are_left_alone(self):
         self.assert_unreadable_scheduled_tasks_are_left_alone(b'{"scheduledTasks": {"daily": {}}}')
 
+    def test_resume_task_that_cannot_be_written_does_not_stop_the_switch(self):
+        (self.h.root / ".claude" / "scheduled-tasks").write_text("")  # a file where its folder goes
+        r = self.switch_after_limit(quiet=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Could not write the resume task", r.stdout)
+        self.assertIn("open -a Claude", self.desktop_log.read_text())
+        self.assertEqual(self.h.state()["watch"]["restored"], "acctB")
+        self.assertFalse((self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json").exists())
+        line = next(l for l in r.stdout.splitlines() if "Sessions moved to" in l)
+        self.assertIn("1 session(s) stopped on the limit. Resume them by hand: the list is in "
+                      f"{self.h.root / '.config' / 'claude-relay' / 'resume.json'}.", line)
+
     def test_no_resume_task_without_stopped_sessions(self):
         self.h.relay("remote", "add", "devbox")
         self.first_pass()

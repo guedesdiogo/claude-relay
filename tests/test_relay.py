@@ -70,8 +70,10 @@ class Env:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-TOKEN_A = "sk-ant-oat01-" + "a" * 40
-TOKEN_B = "sk-ant-oat01-" + "b" * 40
+TOKEN_A = "sk-ant-oat01-" + "a" * 95  # 108 characters, like a token from `claude setup-token`
+TOKEN_B = "sk-ant-oat01-" + "b" * 95
+SPLIT = "sk-ant-oat01-" + "Ab3_" * 23 + "x-y"  # 108 characters, pasted from a narrow terminal below
+SPLIT_LINES = [SPLIT[:51], SPLIT[51:73], SPLIT[73:]]  # the pieces seen on the Mac: 51 and 73 characters
 
 
 class AccountTests(unittest.TestCase):
@@ -96,6 +98,57 @@ class AccountTests(unittest.TestCase):
         self.e.relay("accounts", "remove", "home")
         self.assertFalse(token_file.exists())
         self.assertNotIn("home", self.e.relay("accounts", "list").stdout)
+
+    def saved_token(self, name):
+        return (self.e.home_cfg / "tokens" / name).read_text().strip()
+
+    def test_token_broken_over_lines_is_joined(self):
+        a, b, c = SPLIT_LINES
+        pasted = f"\n{a}\n  {b}  \n{c}\n\nStore this token securely.\n"
+        r = self.e.relay("accounts", "add", "work", stdin=pasted)  # `pbpaste | claude-relay accounts add`
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.saved_token("work"), SPLIT)
+        token_file = self.e.root / "home.token"
+        token_file.write_text(f"{a}\n{b}\n{c}\n")
+        r = self.e.relay("accounts", "add", "home", "--token-file", str(token_file))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.saved_token("home"), SPLIT)
+        quoted = f"export CLAUDE_CODE_OAUTH_TOKEN='{SPLIT[:60]}\n{SPLIT[60:]}'\n"
+        self.assertEqual(relay.parse_token_text(quoted), SPLIT)
+        self.assertEqual(relay.parse_token_text(f"{SPLIT}\nStore this token securely.\n"), SPLIT)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs a pseudo-terminal")
+    def test_hidden_prompt_reads_a_token_pasted_over_lines(self):
+        import pty
+        import select
+        pid, master = pty.fork()
+        if pid == 0:  # the child's stdin and /dev/tty are the pseudo-terminal, as in Terminal.app
+            os.execve(sys.executable, [sys.executable, str(CLI), "accounts", "add", "work"], self.e.env())
+        out, pasted, deadline = b"", False, time.time() + 30
+        while time.time() < deadline:
+            if not pasted and b"Token: " in out:
+                os.write(master, ("\n".join(SPLIT_LINES) + "\n").encode())  # one paste, three lines
+                pasted = True
+            if not select.select([master], [], [], 1)[0]:
+                continue
+            try:
+                data = os.read(master, 4096)
+            except OSError:  # Linux: the child closed the terminal
+                data = b""
+            if not data:
+                break
+            out += data
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.WEXITSTATUS(status), 0, out)
+        self.assertEqual(self.saved_token("work"), SPLIT)
+        self.assertNotIn(SPLIT_LINES[1].encode(), out)  # not echoed
+
+    def test_part_of_a_token_is_refused(self):
+        for piece in (SPLIT_LINES[0], SPLIT[:73], "x" * 108):
+            r = self.e.relay("accounts", "add", "work", stdin=piece + "\n")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("Paste the whole token", r.stderr)
+        self.assertFalse((self.e.home_cfg / "tokens" / "work").exists())
 
     def test_rejects_garbage_token(self):
         r = self.e.relay("accounts", "add", "x", stdin="hello\n")
@@ -229,13 +282,16 @@ class RunTests(unittest.TestCase):
         self.assertEqual([c["account"] for c in self.e.calls()], ["a"])
 
     def test_switches_and_continues_on_limit(self):
+        started = time.time()
         r = self.e.relay("run", "fix the bug", FAKE_SCENARIO="limit")
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = self.e.calls()
         self.assertEqual([c["account"] for c in calls], ["a", "b"])
         self.assertEqual(calls[1]["argv"], ["--resume", "sess-1", CONTINUE])
-        self.assertGreater(self.e.state()["exhausted"]["a"]["until"], time.time())
-        self.assertEqual(self.e.state()["exhausted"]["a"]["reason"], "hit its usage limit")
+        mark = self.e.state()["exhausted"]["a"]
+        self.assertGreater(mark["until"], time.time())
+        self.assertEqual(mark["reason"], "hit its usage limit")
+        self.assertGreater(mark["since"], started)  # so a clear made before the run does not drop it
 
     def test_switches_after_turn_when_marked_exhausted_elsewhere(self):
         r = self.e.relay("run", "fix the bug", FAKE_SCENARIO="marked-elsewhere")

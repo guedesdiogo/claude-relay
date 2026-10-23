@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.2.5 — 2026-10-23
+
+- When `watch` cannot write the task that resumes the sessions stopped on a limit (for example a
+  permission error, or a file where `~/.claude/scheduled-tasks` should be), it now finishes the
+  switch anyway: it reopens Claude Desktop, saves its state and sends the notification, which says
+  to resume the sessions by hand from `resume.json`. Until now the error ended that pass with the
+  app still closed and no notification.
+
 ## 2.2.4 — 2026-10-23
 
 - When `watch` cannot add the task that resumes the sessions stopped on a limit, its macOS

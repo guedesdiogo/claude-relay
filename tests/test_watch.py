@@ -63,7 +63,7 @@ class WatchHome(FakeHome):
         return path
 
     def fake_remote_ssh(self):
-        """ssh that runs claude-relay's sync command against the fake remote HOME and only logs the rest."""
+        """ssh that runs the command against the fake remote HOME; `pkill` is only logged."""
         log = self.root / "ssh.log"
         script = self.bin / "ssh"
         script.write_text(
@@ -72,8 +72,8 @@ class WatchHome(FakeHome):
             "host=\"$1\"; shift\n"
             f"echo \"$host $*\" >> '{log}'\n"
             "case \"$*\" in\n"
-            f"  'python3 - _sync '*) HOME='{self.remote}' exec sh -c \"$*\" ;;\n"
-            "  *) cat > /dev/null ;;\n"
+            "  *pkill*) cat > /dev/null ;;\n"
+            f"  *) HOME='{self.remote}' exec sh -c \"$*\" ;;\n"
             "esac\n")
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
         return log
@@ -188,6 +188,39 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.h.state()["exhausted"]["home"]["until"], self.now + 900)
         self.assertEqual(self.h.state(remote=True)["exhausted"]["work"]["until"], resets)
         self.assertIn("devbox python3 - _sync", self.ssh_log.read_text())
+
+    def test_publishes_the_claude_desktop_account_everywhere(self):
+        self.h.relay("accounts", "link", "work", "acctA")
+        self.h.relay("remote", "add", "devbox")
+        self.first_pass()
+        self.assertEqual(self.h.state()["desktop"], "work")
+        self.assertEqual(self.h.state(remote=True)["desktop"], "work")
+        self.h.relay("accounts", "link", "home", "acctB")
+        self.h.desktop_login("acctB")
+        self.h.watch()
+        self.assertEqual(self.h.state()["desktop"], "home")
+        self.assertEqual(self.h.state(remote=True)["desktop"], "home")
+
+    def test_remote_install_copies_the_script_and_the_account_names(self):
+        token = "sk-ant-oat01-" + "w" * 40
+        token_file = self.h.root / "work.token"
+        token_file.write_text(token + "\n")
+        self.assertEqual(self.h.relay("accounts", "add", "work", "--token-file", str(token_file)).returncode, 0)
+        self.h.relay("accounts", "link", "work", "acctA")
+        self.h.relay("accounts", "link", "home", "acctB")
+        r = self.h.relay("remote", "install", "devbox")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        installed = self.h.remote / ".local" / "bin" / "claude-relay"
+        self.assertEqual(installed.read_text(), Path(relay.__file__).read_text())
+        self.assertTrue(os.access(installed, os.X_OK))
+        cfg = json.loads((self.h.remote / ".config" / "claude-relay" / "config.json").read_text())
+        self.assertEqual({a["name"]: a.get("desktop_account") for a in cfg["accounts"]},
+                         {"work": "acctA", "home": "acctB"})
+        # Tokens stay on this machine: the host gets names and links only.
+        self.assertFalse((self.h.remote / ".config" / "claude-relay" / "tokens").exists())
+        self.assertNotIn(token, self.ssh_log.read_text())
+        self.assertIn("claude-relay accounts add home", r.stdout)
+        self.assertEqual(self.h.relay("remote", "install", "devbox").returncode, 0)  # can run again
 
     def test_unreachable_host_does_not_stop_the_pass(self):
         self.h.relay("remote", "add", "devbox")

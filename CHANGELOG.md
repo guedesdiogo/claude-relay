@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.2.4 — 2026-10-23
+
+- When `watch` cannot add the task that resumes the sessions stopped on a limit, its macOS
+  notification now says so: `Sessions moved to X; N session(s) stopped on the limit. Resume them by
+  hand: the list is in <resume.json>.` Until now only `watch.log` said that they would not resume.
+
 ## 2.2.3 — 2026-10-23
 
 - The one-time task that `watch` registers to resume sessions stopped on a limit no longer widens

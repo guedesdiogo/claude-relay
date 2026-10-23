@@ -309,11 +309,44 @@ class RunTests(unittest.TestCase):
         self.assertTrue(line.startswith("MY-LINE"), line)
         self.assertIn("⇄ a", line)
 
+    def plain(self, call):
+        """Started as plain `claude`: no token, no claude-relay settings."""
+        self.assertIsNone(call["token"])
+        self.assertIsNone(call["account"])
+        self.assertFalse(call["settings"])
+
+    def test_subcommands_go_straight_to_claude(self):
+        # `alias claude='claude-relay run'` must keep `claude setup-token`, `claude mcp list`... working.
+        for argv in (["setup-token"], ["mcp", "list"], ["update"], ["--version"]):
+            with self.subTest(argv=argv):
+                self.e.log.write_text("")
+                r = self.e.relay("run", *argv, FAKE_SCENARIO="exit")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                calls = self.e.calls()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["argv"], argv)
+                self.plain(calls[0])
+
+    def test_without_any_token_runs_plain_claude(self):
+        e = Env()
+        try:
+            e.relay("accounts", "link", "a", "uuid-1")  # an account, but no token yet
+            r = e.relay("run", "hello", FAKE_SCENARIO="exit")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(e.calls()[0]["argv"], ["hello"])
+            self.plain(e.calls()[0])
+            self.assertIn("no account has a token yet", r.stderr)
+            self.assertIn("accounts add", r.stderr)
+        finally:
+            e.cleanup()
+
     def test_no_accounts(self):
         e = Env()
         try:
-            r = e.relay("run")
-            self.assertEqual(r.returncode, 1)
+            r = e.relay("run", FAKE_SCENARIO="exit")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(e.calls()[0]["argv"], [])
+            self.plain(e.calls()[0])
             self.assertIn("accounts add", r.stderr)
         finally:
             e.cleanup()

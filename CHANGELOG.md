@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.2.1 — 2026-10-23
+
+- `claude-relay run` works as a drop-in for `claude` behind `alias claude='claude-relay run'`:
+  Claude Code subcommands (`setup-token`, `mcp`, `update`, `doctor`, `plugin`, `auth`...) and
+  `--version` / `--help` go straight to plain `claude`. Before, `claude setup-token` failed with
+  "unknown option '--settings'".
+- While no account has a token, `run` starts plain `claude` with a note instead of exiting with an
+  error, so the alias can go in before the first `accounts add`.
+
 ## 2.2.0 — 2026-10-23
 
 - The terminal follows Claude Desktop: every pass, `watch` publishes the account Claude Desktop

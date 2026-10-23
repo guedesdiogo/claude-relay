@@ -116,6 +116,9 @@ To use it every time, add an alias to `~/.zshrc` or `~/.bashrc`:
 alias claude='claude-relay run'
 ```
 
+Subcommands such as `claude setup-token`, `claude mcp list` or `claude update`, and `--version` /
+`--help`, go straight to plain `claude`. So does everything else while no account has a token yet.
+
 The status line shows which account is in use and how much of it you have used:
 
 ```

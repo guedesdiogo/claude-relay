@@ -85,6 +85,8 @@ DEFAULT_CONFIG = {
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{20,}$")
+TOKEN_CHARS_RE = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
+MIN_TOKEN_LENGTH = 100  # `claude setup-token` prints 108 characters; fewer means part of it
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 COLORS = {"gray": "90", "white": "97", "cyan": "36", "green": "32", "yellow": "33", "red": "31"}
@@ -164,6 +166,7 @@ def load_state():
     st.setdefault("active", None)
     st.setdefault("usage", {})
     st.setdefault("exhausted", {})
+    st.setdefault("cleared", {})  # {name: epoch}: when `reset`, `use` or `accounts add` last cleared its mark
     return st
 
 
@@ -243,16 +246,58 @@ def token_delete(name, store):
 
 
 def parse_token_text(text):
-    """Accept a raw token or a line like `export CLAUDE_CODE_OAUTH_TOKEN=...`."""
-    for line in (text or "").splitlines():
+    """Accept a raw token or a line like `export CLAUDE_CODE_OAUTH_TOKEN=...`. A token copied from a
+    narrow terminal arrives broken over lines: the lines after `sk-ant-...` that hold only token
+    characters are joined back to it, without the spaces around them."""
+    lines = (text or "").splitlines()
+    for i, line in enumerate(lines):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         m = re.search(r"CLAUDE_CODE_OAUTH_TOKEN\s*=\s*['\"]?([^'\"\s]+)", line)
         candidate = m.group(1) if m else line
+        if candidate.startswith("sk-ant-"):
+            for more in lines[i + 1:]:
+                more = more.strip().rstrip("'\"")  # the closing quote of an `export` line
+                if not TOKEN_CHARS_RE.match(more):
+                    break
+                candidate += more
         if TOKEN_RE.match(candidate):
             return candidate
     return None
+
+
+PASTE_WAIT = 0.2  # seconds: the other lines of one paste arrive well within this
+
+
+def read_hidden(prompt):
+    """Read a pasted token from the terminal with echo off. getpass returns only the first line of
+    a token broken over lines, and leaves the rest for the shell, which runs it as commands. Here
+    the lines that follow within PASTE_WAIT are read too, still without echo, and what arrives after
+    that is discarded."""
+    try:
+        import select
+        import termios
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except (ImportError, OSError):
+        return getpass.getpass(prompt)
+    chunks = []
+    try:
+        old = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        new[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSAFLUSH, new)
+        try:
+            os.write(fd, prompt.encode())
+            chunks.append(os.read(fd, 4096))  # a terminal hands over one line per read
+            while chunks[-1] and select.select([fd], [], [], PASTE_WAIT)[0]:
+                chunks.append(os.read(fd, 4096))
+        finally:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, old)
+            os.write(fd, b"\n")
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -266,12 +311,36 @@ def exhausted_until(mark):
     return mark.get("until") if isinstance(mark, dict) else mark
 
 
-def merge_exhausted(dst, src):
-    """Merge `exhausted` marks from another machine: for each account the later reset wins."""
-    for name, mark in (src or {}).items():
+def mark_since(mark):
+    """When an `exhausted` mark was made; None for marks from versions before 2.2.2."""
+    return mark.get("since") if isinstance(mark, dict) else None
+
+
+def merge_marks(st, other):
+    """Merge another machine's `exhausted` marks and `cleared` times into the state `st`. For each
+    account the later clear wins, marks made before it are dropped on both sides (a mark without
+    `since` counts as older than any clear), and among the marks left the later reset wins."""
+    cleared, marks = st["cleared"], st["exhausted"]
+    for name, at in (other.get("cleared") or {}).items():
+        if isinstance(at, (int, float)) and at > (cleared.get(name) or 0):
+            cleared[name] = at
+
+    def stale(name, mark):
+        return name in cleared and (mark_since(mark) or 0) <= cleared[name]
+
+    for name in [n for n, m in marks.items() if stale(n, m)]:
+        del marks[name]
+    for name, mark in (other.get("exhausted") or {}).items():
         until = exhausted_until(mark)
-        if isinstance(until, (int, float)) and until > (exhausted_until(dst.get(name)) or 0):
-            dst[name] = mark if isinstance(mark, dict) else {"until": until, "reason": "hit its limit"}
+        if (isinstance(until, (int, float)) and not stale(name, mark)
+                and until > (exhausted_until(marks.get(name)) or 0)):
+            marks[name] = mark if isinstance(mark, dict) else {"until": until, "reason": "hit its limit"}
+
+
+def clear_mark(st, name):
+    """Forget `name`'s exhausted mark here; `cleared` makes that win over the other machines' copies."""
+    st["exhausted"].pop(name, None)
+    st["cleared"][name] = time.time()
 
 
 def account_block(name, state, threshold, now=None):
@@ -373,9 +442,12 @@ def cmd_accounts_add(args):
     else:
         say(f"Paste the long-lived token for '{name}'. Create it with `claude setup-token` while signed in", "cyan")
         say("to that account in your browser. The token is hidden while you paste.", "cyan")
-        token = parse_token_text(getpass.getpass("Token: "))
+        token = parse_token_text(read_hidden("Token: "))
     if not token:
         die("That does not look like a token from `claude setup-token`.")
+    if not token.startswith("sk-ant-") or len(token) < MIN_TOKEN_LENGTH:
+        die(f"That is not a whole token from `claude setup-token` ({len(token)} characters; a token starts with "
+            f"sk-ant- and has about 108). Paste the whole token. Nothing was saved.")
     token_set(name, token, store)
 
     def upd(cfg):
@@ -389,7 +461,13 @@ def cmd_accounts_add(args):
     with Locked():
         cfg = upd(load_config())
         save_config(cfg)
-    update_state(lambda st: st.update(active=st.get("active") or name))
+
+    def upd_state(st):
+        st["active"] = st.get("active") or name
+        mark = st["exhausted"].get(name)
+        if isinstance(mark, dict) and mark.get("reason") == TOKEN_REJECTED:  # a usage limit stays
+            clear_mark(st, name)
+    update_state(upd_state)
     say(f"Saved account '{name}' ({'macOS Keychain' if store == 'keychain' else TOKENS_DIR / name}).", "green")
     return 0
 
@@ -460,7 +538,7 @@ def cmd_use(args):
 
     def upd(st):
         st["active"] = args.name
-        st["exhausted"].pop(args.name, None)
+        clear_mark(st, args.name)
     st = update_state(upd)
     say(f"Active account: {args.name}", "green")
     follow = desktop_choice(cfg, st)
@@ -471,11 +549,13 @@ def cmd_use(args):
 
 
 def cmd_reset(args):
+    accounts = [a["name"] for a in load_config()["accounts"]]  # a mark may be only on another machine
+
     def upd(st):
-        names = [args.name] if args.name else list(st["usage"].keys()) + list(st["exhausted"].keys())
+        names = [args.name] if args.name else accounts + list(st["usage"].keys()) + list(st["exhausted"].keys())
         for n in names:
             st["usage"].pop(n, None)
-            st["exhausted"].pop(n, None)
+            clear_mark(st, n)
     update_state(upd)
     say("Forgot the recorded usage; accounts will be tried again.", "green")
     return 0
@@ -950,6 +1030,7 @@ def transcript_tail(path, max_bytes=20000):
 
 
 SWITCH_ERRORS = ("rate_limit", "billing_error", "authentication_failed")
+TOKEN_REJECTED = "token rejected"  # the mark's reason; `accounts add` lifts it
 
 
 def handle_failure(run_id, account, sid, error, message):
@@ -966,7 +1047,7 @@ def handle_failure(run_id, account, sid, error, message):
     cooldown = time.time() + 60 * int(cfg.get("cooldown_minutes") or 30)
     if error == "authentication_failed":
         reason, short, until = ("had its token rejected (run `claude-relay accounts add` again)",
-                                "token rejected", time.time() + 86400)
+                                TOKEN_REJECTED, time.time() + 86400)
     elif error == "billing_error":
         reason, short, until = "has a billing problem", "billing problem", cooldown
     else:
@@ -975,7 +1056,8 @@ def handle_failure(run_id, account, sid, error, message):
                   if (w.get("used") or 0) >= 99 and w.get("resets_at")]
         reason, short, until = "hit its usage limit", "hit its usage limit", (max(resets) if resets else cooldown)
     if account:
-        update_state(lambda st: st["exhausted"].__setitem__(account, {"until": until, "reason": short}))
+        update_state(lambda st: st["exhausted"].__setitem__(
+            account, {"until": until, "reason": short, "since": time.time()}))
 
     def upd(r):
         if sid:
@@ -1654,7 +1736,8 @@ def scan_transcripts(projects_root, since, check=()):
 
 def internal_sync(payload):
     """Run on an SSH host by `watch`, which pipes this script to `python3 -`: take the Mac's
-    `exhausted` marks (and the account to prefer), then report this host's transcripts and marks."""
+    `exhausted` marks and `cleared` times (and the account to prefer), then report this host's
+    transcripts, marks and cleared times."""
     try:
         p = json.loads(payload)
     except Exception:
@@ -1662,14 +1745,14 @@ def internal_sync(payload):
     cfg = load_config()
 
     def upd(st):
-        merge_exhausted(st["exhausted"], p.get("exhausted"))
+        merge_marks(st, p)
         if p.get("active") and find_account(cfg, p["active"]):
             st["active"] = p["active"]
         if p.get("desktop"):
             st["desktop"], st["desktop_at"] = p["desktop"], time.time()
     st = update_state(upd)
     out = scan_transcripts(DEFAULT_PROJECTS, float(p["since"]), p.get("check") or []) if "since" in p else {}
-    out["exhausted"] = st["exhausted"]
+    out["exhausted"], out["cleared"] = st["exhausted"], st["cleared"]
     sys.stdout.write(json.dumps(out) + "\n")
     return 0
 
@@ -1825,10 +1908,12 @@ def watch_pass(cfg):
         check.setdefault(p["host"], []).append(p["cli"])
 
     # SSH hosts first: Claude Desktop may keep a local copy of a remote session's transcript.
-    results, marks, unreachable = {}, dict(st["exhausted"]), []
+    merged = {"exhausted": dict(st["exhausted"]), "cleared": dict(st["cleared"])}
+    marks, cleared = merged["exhausted"], merged["cleared"]
+    results, unreachable = {}, []
     for host in cfg.get("remotes") or []:
         payload = {"since": max(0, (since.get(host) or now) - SCAN_OVERLAP), "exhausted": st["exhausted"],
-                   "check": check.get(host, [])}
+                   "cleared": st["cleared"], "check": check.get(host, [])}
         if active:
             payload["active"] = active
         if account:
@@ -1840,7 +1925,7 @@ def watch_pass(cfg):
             continue
         results[host] = reply
         since[host] = now
-        merge_exhausted(marks, reply.get("exhausted"))
+        merge_marks(merged, reply)
     results["local"] = scan_transcripts(DEFAULT_PROJECTS, max(0, (since.get("local") or now) - SCAN_OVERLAP),
                                         check.get("local", []))
     since["local"] = now
@@ -1862,8 +1947,9 @@ def watch_pass(cfg):
                 pending.append({"host": host, "cli": ev["cli"], "account": owner, "ts": ev["ts"]})
             until = ev.get("until") or ev["ts"] + 60 * int(cfg.get("cooldown_minutes") or 30)
             name = desktop_key(cfg, owner)
-            if until > now and until > (exhausted_until(marks.get(name)) or 0):
-                marks[name] = {"until": until, "reason": limit_reason(ev.get("window"))}
+            # A limit from before the account was cleared stays cleared, even when first seen now.
+            if until > now and ev["ts"] > (cleared.get(name) or 0) and until > (exhausted_until(marks.get(name)) or 0):
+                marks[name] = {"until": until, "reason": limit_reason(ev.get("window")), "since": ev["ts"]}
                 new_marks[name] = owner
     for name, owner in new_marks.items():
         mark = marks[name]
@@ -1876,7 +1962,7 @@ def watch_pass(cfg):
     if new_marks:  # let the hosts' `claude-relay run` switch now rather than on the next pass
         for host in results:
             if host != "local":
-                remote_sync(host, {"exhausted": marks})
+                remote_sync(host, merged)
 
     # Claude Desktop is signed in to another account: move the sessions once it is quiet.
     restored = w.get("restored")
@@ -1941,7 +2027,7 @@ def watch_pass(cfg):
     w.update(history=history, since=since, pending=pending, seen=seen[-500:])
 
     def upd(s):
-        merge_exhausted(s["exhausted"], marks)
+        merge_marks(s, merged)  # against the state as it is now: a `reset` during this pass still wins
         if active and find_account(cfg, active):
             s["active"] = active
         if account:  # `run` here follows it

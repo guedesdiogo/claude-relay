@@ -5,6 +5,7 @@ import json
 import os
 import plistlib
 import stat
+import subprocess
 import sys
 import time
 import unittest
@@ -12,10 +13,11 @@ import uuid
 from pathlib import Path
 
 from test_desktop import NOT_AN_ANCESTOR, FakeHome
-from test_relay import load_module
+from test_relay import CLI, load_module
 
 relay = load_module()
 WEEKLY = "You've hit your weekly limit · resets 5pm (America/Sao_Paulo)"
+TOKEN_G = "sk-ant-oat01-" + "g" * 95
 
 
 def iso(epoch):
@@ -63,14 +65,17 @@ class WatchHome(FakeHome):
         return path
 
     def fake_remote_ssh(self):
-        """ssh that runs the command against the fake remote HOME; `pkill` is only logged."""
+        """ssh that runs the command against the fake remote HOME; `pkill` is only logged. A script in
+        `during-ssh` runs once on this machine first, as if typed while `watch` waits on ssh."""
         log = self.root / "ssh.log"
+        during = self.root / "during-ssh"
         script = self.bin / "ssh"
         script.write_text(
             "#!/bin/sh\n"
             "while [ $# -gt 0 ]; do case \"$1\" in -o) shift 2 ;; -*) shift ;; *) break ;; esac; done\n"
             "host=\"$1\"; shift\n"
             f"echo \"$host $*\" >> '{log}'\n"
+            f"if [ -e '{during}' ]; then sh '{during}' < /dev/null; rm -f '{during}'; fi\n"
             "case \"$*\" in\n"
             "  *pkill*) cat > /dev/null ;;\n"
             f"  *) HOME='{self.remote}' exec sh -c \"$*\" ;;\n"
@@ -81,9 +86,18 @@ class WatchHome(FakeHome):
     def watch(self):
         return self.relay("watch", "--once")
 
+    def relay_on_host(self, *args):
+        return subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True,
+                              env=dict(self.env(), HOME=str(self.remote)))
+
     def state(self, remote=False):
         path = (self.remote if remote else self.root) / ".config" / "claude-relay" / "state.json"
         return json.loads(path.read_text()) if path.exists() else {}
+
+    def write_state(self, data, remote=False):
+        path = (self.remote if remote else self.root) / ".config" / "claude-relay" / "state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
 
     def resume_list(self):
         return json.loads((self.root / ".config" / "claude-relay" / "resume.json").read_text())
@@ -115,6 +129,24 @@ class LimitEntryTests(unittest.TestCase):
         e = limit_entry(100, 5000)
         del e["quotaLimits"]
         self.assertEqual(relay.limit_from_entry(e), (None, None))
+
+
+class MergeMarksTests(unittest.TestCase):
+    def test_a_clear_drops_older_marks_on_both_sides(self):
+        # A host learns of a clear: its own older mark (no `since`, as 2.2.1 wrote it) goes.
+        st = {"exhausted": {"a": {"until": 500, "reason": "token rejected"}, "b": 400}, "cleared": {}}
+        relay.merge_marks(st, {"exhausted": {"c": {"until": 900, "reason": "x", "since": 300}},
+                               "cleared": {"a": 100, "c": 200}})
+        self.assertEqual(st["exhausted"], {"b": 400, "c": {"until": 900, "reason": "x", "since": 300}})
+        # A mark read before a clear that happened meanwhile does not come back; the later clear wins.
+        relay.merge_marks(st, {"exhausted": {"a": {"until": 600, "reason": "y", "since": 50}}, "cleared": {"a": 90}})
+        self.assertNotIn("a", st["exhausted"])
+        self.assertEqual(st["cleared"], {"a": 100, "c": 200})
+        # Among the marks made after the clear, the later reset wins.
+        relay.merge_marks(st, {"exhausted": {"a": {"until": 700, "reason": "z", "since": 150},
+                                             "c": {"until": 800, "reason": "w", "since": 400}}})
+        self.assertEqual(st["exhausted"]["a"]["until"], 700)
+        self.assertEqual(st["exhausted"]["c"]["until"], 900)
 
 
 class WatchTests(unittest.TestCase):
@@ -154,7 +186,7 @@ class WatchTests(unittest.TestCase):
         r = self.h.watch()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.h.state()["exhausted"],
-                         {"acctA": {"until": resets, "reason": "hit its weekly limit"}})
+                         {"acctA": {"until": resets, "reason": "hit its weekly limit", "since": int(t + 1)}})
         self.assertIn("acctA hit its weekly limit", r.stdout)
 
     def test_linked_name_and_expired_limits(self):
@@ -189,6 +221,96 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.h.state(remote=True)["exhausted"]["work"]["until"], resets)
         self.assertIn("devbox python3 - _sync", self.ssh_log.read_text())
 
+    def mark_on_both_machines(self, reason):
+        """A mark for `great` on the Mac and on the host, the way 2.2.1 wrote it (no `since`)."""
+        self.h.relay("remote", "add", "devbox")
+        self.h.relay("accounts", "link", "great", "acctG")
+        mark = {"until": self.now + 86400, "reason": reason}
+        for remote in (False, True):
+            self.h.write_state({"active": "great", "usage": {}, "exhausted": {"great": mark}}, remote=remote)
+        self.first_pass()
+
+    def marks_after_two_passes(self):
+        for _ in range(2):
+            r = self.h.watch()
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return self.h.state()["exhausted"], self.h.state(remote=True)["exhausted"]
+
+    def test_reset_on_the_mac_survives_watch_with_the_mark_still_on_the_host(self):
+        self.mark_on_both_machines("token rejected")
+        self.assertEqual(self.h.relay("reset", "great").returncode, 0)
+        self.assertNotIn("great", self.h.state()["exhausted"])
+        self.assertIn("great", self.h.state(remote=True)["exhausted"])
+        self.assertEqual(self.marks_after_two_passes(), ({}, {}))
+        self.assertGreater(self.h.state(remote=True)["cleared"]["great"], self.now)
+
+    def test_reset_during_a_watch_pass_is_not_undone(self):
+        self.mark_on_both_machines("token rejected")
+        # `reset` runs while this pass waits on ssh, after it read the state it will write back.
+        (self.h.root / "during-ssh").write_text(f"'{sys.executable}' '{CLI}' reset great\n")
+        r = self.h.watch()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((self.h.root / "during-ssh").exists())
+        self.assertIn("great", self.h.state(remote=True)["exhausted"])  # the host got the old snapshot
+        self.assertNotIn("great", self.h.state()["exhausted"])
+        self.assertEqual(self.marks_after_two_passes(), ({}, {}))
+
+    def test_use_on_the_mac_clears_the_mark_everywhere(self):
+        self.mark_on_both_machines("hit its weekly limit")
+        self.assertEqual(self.h.relay("use", "great").returncode, 0)
+        self.assertEqual(self.marks_after_two_passes(), ({}, {}))
+
+    def test_reset_on_the_host_clears_the_mark_on_the_mac(self):
+        self.mark_on_both_machines("token rejected")
+        self.assertEqual(self.h.relay_on_host("reset", "great").returncode, 0)
+        self.assertEqual(self.marks_after_two_passes(), ({}, {}))
+
+    def test_plain_reset_covers_a_mark_only_on_the_host(self):
+        self.h.relay("remote", "add", "devbox")
+        self.h.relay("accounts", "link", "great", "acctG")
+        self.h.write_state({"active": "great", "usage": {},
+                            "exhausted": {"great": {"until": self.now + 86400, "reason": "token rejected"}}},
+                           remote=True)
+        self.assertEqual(self.h.relay("reset").returncode, 0)
+        self.assertEqual(self.marks_after_two_passes(), ({}, {}))
+
+    def test_a_new_token_lifts_a_rejected_token_mark_everywhere(self):
+        self.mark_on_both_machines("token rejected")
+        token_file = self.h.root / "great.token"
+        token_file.write_text(TOKEN_G + "\n")
+        self.assertEqual(self.h.relay("accounts", "add", "great", "--token-file", str(token_file)).returncode, 0)
+        self.assertEqual(self.marks_after_two_passes(), ({}, {}))
+
+    def test_a_new_token_keeps_a_usage_limit_mark(self):
+        self.mark_on_both_machines("hit its weekly limit")
+        token_file = self.h.root / "great.token"
+        token_file.write_text(TOKEN_G + "\n")
+        self.assertEqual(self.h.relay("accounts", "add", "great", "--token-file", str(token_file)).returncode, 0)
+        mac, host = self.marks_after_two_passes()
+        self.assertEqual((mac["great"]["reason"], host["great"]["reason"]),
+                         ("hit its weekly limit", "hit its weekly limit"))
+
+    def test_only_a_limit_after_the_reset_marks_the_account_again(self):
+        self.h.relay("remote", "add", "devbox")
+        self.first_pass()
+        st = self.h.state()
+        st["watch"]["history"] = [[self.now - 600, "acctA"]]  # as if `watch` had run for 10 minutes
+        self.h.write_state(st)
+        t = time.time()
+        resets = int(t + 3600)
+        self.h.transcript("S1", [limit_entry(t - 5, resets)], age=1)  # before the reset, seen after it
+        self.assertEqual(self.h.relay("reset", "acctA").returncode, 0)
+        r = self.h.watch()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("hit its weekly limit", r.stdout)
+        self.assertEqual(self.h.state()["exhausted"], {})
+        t = time.time()
+        self.h.transcript("S2", [limit_entry(t + 1, resets)], age=1)
+        r = self.h.watch()
+        self.assertIn("acctA hit its weekly limit", r.stdout)
+        self.assertEqual(self.h.state()["exhausted"]["acctA"]["until"], resets)
+        self.assertEqual(self.h.state(remote=True)["exhausted"]["acctA"]["until"], resets)
+
     def test_publishes_the_claude_desktop_account_everywhere(self):
         self.h.relay("accounts", "link", "work", "acctA")
         self.h.relay("remote", "add", "devbox")
@@ -202,7 +324,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.h.state(remote=True)["desktop"], "home")
 
     def test_remote_install_copies_the_script_and_the_account_names(self):
-        token = "sk-ant-oat01-" + "w" * 40
+        token = "sk-ant-oat01-" + "w" * 95
         token_file = self.h.root / "work.token"
         token_file.write_text(token + "\n")
         self.assertEqual(self.h.relay("accounts", "add", "work", "--token-file", str(token_file)).returncode, 0)

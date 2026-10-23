@@ -46,6 +46,16 @@ class FakeHome:
             card["lastActivityAt"] = last
         (d / f"local_{cli_id}.json").write_text(json.dumps(card))
 
+    def add_tasks(self, account, org, tasks, **extra):
+        """Claude Desktop's per-account scheduled-tasks.json (format observed in October 2026)."""
+        d = self.cards / account / org
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "scheduled-tasks.json").write_text(json.dumps(dict({"scheduledTasks": tasks}, **extra)))
+
+    def tasks_of(self, account, org):
+        path = self.cards / account / org / "scheduled-tasks.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
     def add_transcript(self, cli_id, lines):
         (self.projects / f"{cli_id}.jsonl").write_text("\n".join(json.dumps(l) for l in lines) + "\n")
 
@@ -155,6 +165,64 @@ class DesktopTests(unittest.TestCase):
         card = next(c for c in self.h.cards_of("acctA", "orgA") if c["cliSessionId"] == "S9")
         self.assertEqual((card["title"], card["lastActivityAt"]), ("renamed in B", 200))
         self.assertIn("updated 1 with newer activity", r.stdout)
+
+    def test_recurring_scheduled_tasks_follow_the_account(self):
+        daily = {"id": "daily", "displayName": "Daily", "cronExpression": "30 8 * * *", "enabled": True,
+                 "filePath": "/Users/x/.claude/scheduled-tasks/daily/SKILL.md", "createdAt": 100,
+                 "cwd": "/Users/x/Repos", "permissionMode": "auto", "permissionModeCarried": True,
+                 "lastRunAt": "2026-10-17T11:39:41.471Z", "lastScheduledFor": "2026-10-17T11:30:00.000Z",
+                 "notifySessionId": "local_abc"}
+        self.h.add_tasks("acctA", "orgA", [
+            daily,
+            {"id": "shared", "cronExpression": "0 9 * * 1", "enabled": True, "filePath": "/a/SKILL.md"},
+            {"id": "once", "fireAt": 1792000000000, "enabled": True, "filePath": "/o/SKILL.md"},
+            {"id": "claude-relay-resume", "fireAt": 1792000000000, "enabled": True, "filePath": "/r/SKILL.md"},
+        ], recordedSkips={"daily": ["from A"]})
+        self.h.add_tasks("acctC", "orgC", [dict(daily, cwd="/Users/x/other")])
+        mine = {"id": "shared", "cronExpression": "0 18 * * 5", "enabled": False, "filePath": "/b/SKILL.md"}
+        self.h.add_tasks("acctB", "orgB", [mine], recordedSkips={}, sundayAliasBoundaryStamped=True)
+        self.h.desktop_login("acctB")
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Copied 1 scheduled task(s) from other accounts.", r.stdout)
+        data = self.h.tasks_of("acctB", "orgB")
+        # The destination keeps its own tasks and fields; recurring tasks from other accounts are added
+        # once each, without the bookkeeping of their last run there.
+        self.assertEqual([t["id"] for t in data["scheduledTasks"]], ["shared", "daily"])
+        self.assertEqual(data["scheduledTasks"][0], mine)
+        copied = data["scheduledTasks"][1]
+        for k in ("lastRunAt", "lastScheduledFor", "notifySessionId"):
+            self.assertNotIn(k, copied)
+        self.assertEqual(copied["cronExpression"], "30 8 * * *")
+        self.assertEqual((copied["permissionMode"], copied["permissionModeCarried"]), ("auto", True))
+        self.assertEqual(data["recordedSkips"], {})
+        self.assertIs(data["sundayAliasBoundaryStamped"], True)
+        # The sources are left as they were.
+        self.assertEqual(len(self.h.tasks_of("acctA", "orgA")["scheduledTasks"]), 4)
+        r = self.h.run("--existing-cards-only")
+        self.assertIn("Copied 0 scheduled task(s) from other accounts.", r.stdout)
+        self.assertEqual(len(self.h.tasks_of("acctB", "orgB")["scheduledTasks"]), 2)
+
+    def test_scheduled_tasks_file_is_created_and_dry_run_only_counts(self):
+        self.h.add_tasks("acctA", "orgA", [{"id": "daily", "cronExpression": "30 8 * * *", "enabled": True}])
+        self.h.login("acctB", "orgB")
+        r = self.h.run("--dry-run")
+        self.assertIn("Would copy 1 scheduled task(s) from other accounts.", r.stdout)
+        self.assertIsNone(self.h.tasks_of("acctB", "orgB"))
+        r = self.h.run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.h.tasks_of("acctB", "orgB"),
+                         {"scheduledTasks": [{"id": "daily", "cronExpression": "30 8 * * *", "enabled": True}]})
+
+    def test_unreadable_scheduled_tasks_file_is_left_alone(self):
+        self.h.add_tasks("acctA", "orgA", [{"id": "daily", "cronExpression": "30 8 * * *", "enabled": True}])
+        (self.h.cards / "acctB" / "orgB").mkdir(parents=True)
+        (self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json").write_text("{not json")
+        self.h.desktop_login("acctB")
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Could not read", r.stdout)
+        self.assertEqual((self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json").read_text(), "{not json")
 
     def test_existing_cards_only(self):
         self.h.login("acctB", "orgB")

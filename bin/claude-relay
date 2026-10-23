@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -1345,6 +1345,41 @@ def sync_card(src_card, dst_path, dry_run):
     return changed
 
 
+TASK_RUN_FIELDS = ("lastRunAt", "lastScheduledFor", "notifySessionId")
+
+
+def copy_scheduled_tasks(cards_root, dest, dry_run):
+    """Add the recurring Claude Desktop scheduled tasks of other accounts to `dest`'s scheduled-tasks.json.
+
+    The prompts in ~/.claude/scheduled-tasks are shared, but each account registers its own tasks (see
+    register_resume_task). Tasks `dest` already has stay as they are; one-time tasks and the record of
+    a task's last run in the other account are left behind. Returns how many tasks were copied, or None
+    when `dest`'s file exists but cannot be read."""
+    path = dest / "scheduled-tasks.json"
+    data = load_json(path) if path.exists() else {}
+    if not isinstance(data, dict):
+        return None
+    tasks = list(data.get("scheduledTasks") or [])
+    have = {t.get("id") for t in tasks if isinstance(t, dict)}
+    copied = 0
+    # Newest file first: when two accounts have the same task, the one used last wins.
+    for src in sorted(cards_root.glob("*/*/scheduled-tasks.json"), key=lambda p: (-p.stat().st_mtime, str(p))):
+        other = load_json(src)
+        if same_dir(src.parent, dest) or not isinstance(other, dict):
+            continue
+        for t in other.get("scheduledTasks") or []:
+            if not isinstance(t, dict) or not t.get("cronExpression") or t.get("id") in have or \
+                    t.get("id") in (None, RESUME_TASK):
+                continue
+            tasks.append({k: v for k, v in t.items() if k not in TASK_RUN_FIELDS})
+            have.add(t["id"])
+            copied += 1
+    if copied and not dry_run:
+        data["scheduledTasks"] = tasks
+        write_json(path, data, mode=0o644)
+    return copied
+
+
 def restart_remote_helpers(hosts, dry_run):
     """Claude Desktop starts a helper server on each SSH host with the credentials of the account that
     started it. Stopping it makes Claude Desktop start a fresh one with the current account."""
@@ -1464,6 +1499,12 @@ def cmd_desktop(args):
         copied += 1
     say(f"{'Would copy' if args.dry_run else 'Copied'} {copied} card(s) from other accounts"
         f"{f'; updated {synced} with newer activity' if synced else ''}.", "green")
+
+    tasks = copy_scheduled_tasks(cards_root, dest, args.dry_run)
+    if tasks is None:
+        say(f"Could not read {dest / 'scheduled-tasks.json'}, so no scheduled tasks were copied.", "yellow")
+    else:
+        say(f"{'Would copy' if args.dry_run else 'Copied'} {tasks} scheduled task(s) from other accounts.", "green")
 
     if args.existing_cards_only:
         say("--existing-cards-only: CLI / VS Code sessions skipped.", "yellow")

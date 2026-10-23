@@ -197,15 +197,20 @@ class RunTests(unittest.TestCase):
         self.assertIn("switching to 'b'", r.stderr)
 
     def test_starts_on_the_claude_desktop_account(self):
-        self.e.write_state({"active": "a", "usage": {}, "exhausted": {}, "desktop": "b"})
+        published = {"active": "a", "usage": {}, "exhausted": {}, "desktop": "b", "desktop_at": time.time()}
+        self.e.write_state(published)
         r = self.e.relay("run", FAKE_SCENARIO="exit")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.e.calls()[0]["account"], "b")
-        self.e.relay("config", "follow_desktop", "false")
-        self.e.write_state({"active": "a", "usage": {}, "exhausted": {}, "desktop": "b"})
-        self.e.log.write_text("")
-        self.e.relay("run", FAKE_SCENARIO="exit")
-        self.assertEqual(self.e.calls()[0]["account"], "a")
+        self.assertIn("run` follows Claude Desktop's account (b)", self.e.relay("use", "a").stdout)
+        for state, cfg in ((dict(published, desktop_at=time.time() - 3600), None),  # watch stopped
+                           (published, "false")):
+            if cfg:
+                self.e.relay("config", "follow_desktop", cfg)
+            self.e.write_state(state)
+            self.e.log.write_text("")
+            self.e.relay("run", FAKE_SCENARIO="exit")
+            self.assertEqual(self.e.calls()[0]["account"], "a")
 
     def test_switches_after_turn_when_claude_desktop_switches(self):
         r = self.e.relay("run", "fix the bug", FAKE_SCENARIO="desktop-switch")
@@ -217,7 +222,7 @@ class RunTests(unittest.TestCase):
 
     def test_does_not_follow_an_exhausted_desktop_account(self):
         future = time.time() + 3600
-        self.e.write_state({"active": "a", "usage": {}, "desktop": "b",
+        self.e.write_state({"active": "a", "usage": {}, "desktop": "b", "desktop_at": time.time(),
                             "exhausted": {"b": {"until": future, "reason": "hit its weekly limit"}}})
         r = self.e.relay("run", FAKE_SCENARIO="desktop-switch", FAKE_WAIT="3")
         self.assertEqual(r.returncode, 0, r.stderr)

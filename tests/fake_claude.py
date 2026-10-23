@@ -89,7 +89,7 @@ def main():
         path = os.path.join(os.environ["CLAUDE_RELAY_HOME"], "state.json")
         with open(path) as f:
             state = json.load(f)
-        state["desktop"] = os.environ.get("FAKE_DESKTOP", "b")
+        state["desktop"], state["desktop_at"] = os.environ.get("FAKE_DESKTOP", "b"), time.time()
         with open(path, "w") as f:
             json.dump(state, f)
         hook("Stop", {"session_id": sid, "hook_event_name": "Stop"})

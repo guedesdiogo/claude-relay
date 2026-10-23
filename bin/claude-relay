@@ -309,9 +309,14 @@ def choose_account(cfg, state, exclude=(), prefer=None):
     return None
 
 
+DESKTOP_FRESH = 600  # `watch` publishes every 30 s; an older value means it stopped (or the Mac sleeps)
+
+
 def desktop_choice(cfg, state):
     """The account Claude Desktop uses (published by `watch`), when `run` follows it and can use it."""
     name = state.get("desktop")
+    if time.time() - (state.get("desktop_at") or 0) > DESKTOP_FRESH:
+        return None
     acc = find_account(cfg, name) if cfg.get("follow_desktop", True) else None
     if acc and account_block(name, state, cfg["threshold"]) is None and token_get(name, acc.get("store", "file")):
         return name
@@ -456,8 +461,12 @@ def cmd_use(args):
     def upd(st):
         st["active"] = args.name
         st["exhausted"].pop(args.name, None)
-    update_state(upd)
+    st = update_state(upd)
     say(f"Active account: {args.name}", "green")
+    follow = desktop_choice(cfg, st)
+    if follow and follow != args.name:
+        say(f"Note: `{PROG} run` follows Claude Desktop's account ({follow}). To keep {args.name}, run: "
+            f"{PROG} config follow_desktop false", "yellow")
     return 0
 
 
@@ -1048,7 +1057,7 @@ def internal_hook(event):
         state = load_state()
         mark = state["exhausted"].get(account) if account else None
         marked = (exhausted_until(mark) or 0) > time.time()
-        follow = desktop_choice(load_config(), state)
+        follow = desktop_choice(load_config(), state) if state.get("desktop") not in (None, account) else None
 
         def upd(r):
             remember(r)
@@ -1372,7 +1381,7 @@ def restart_remote_helpers(hosts, dry_run):
             say(f"Would restart Claude Desktop's helpers on {host}.", "yellow")
             continue
         try:
-            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote_cmd],
+            r = subprocess.run(ssh_command(host) + [remote_cmd],
                                capture_output=True, text=True, timeout=30)
             if r.returncode == 0:
                 say(f"Restarted Claude Desktop's helpers on {host}.", "green")
@@ -1605,7 +1614,7 @@ def internal_sync(payload):
         if p.get("active") and find_account(cfg, p["active"]):
             st["active"] = p["active"]
         if p.get("desktop"):
-            st["desktop"] = p["desktop"]
+            st["desktop"], st["desktop_at"] = p["desktop"], time.time()
     st = update_state(upd)
     out = scan_transcripts(DEFAULT_PROJECTS, float(p["since"]), p.get("check") or []) if "since" in p else {}
     out["exhausted"] = st["exhausted"]
@@ -1867,8 +1876,8 @@ def watch_pass(cfg):
         merge_exhausted(s["exhausted"], marks)
         if active and find_account(cfg, active):
             s["active"] = active
-        if account:
-            s["desktop"] = desktop_key(cfg, account)  # `run` here follows it
+        if account:  # `run` here follows it
+            s["desktop"], s["desktop_at"] = desktop_key(cfg, account), time.time()
         s["watch"] = w
     update_state(upd)
     return 0

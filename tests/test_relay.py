@@ -229,13 +229,16 @@ class RunTests(unittest.TestCase):
         self.assertEqual([c["account"] for c in self.e.calls()], ["a"])
 
     def test_switches_and_continues_on_limit(self):
+        started = time.time()
         r = self.e.relay("run", "fix the bug", FAKE_SCENARIO="limit")
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = self.e.calls()
         self.assertEqual([c["account"] for c in calls], ["a", "b"])
         self.assertEqual(calls[1]["argv"], ["--resume", "sess-1", CONTINUE])
-        self.assertGreater(self.e.state()["exhausted"]["a"]["until"], time.time())
-        self.assertEqual(self.e.state()["exhausted"]["a"]["reason"], "hit its usage limit")
+        mark = self.e.state()["exhausted"]["a"]
+        self.assertGreater(mark["until"], time.time())
+        self.assertEqual(mark["reason"], "hit its usage limit")
+        self.assertGreater(mark["since"], started)  # so a clear made before the run does not drop it
 
     def test_switches_after_turn_when_marked_exhausted_elsewhere(self):
         r = self.e.relay("run", "fix the bug", FAKE_SCENARIO="marked-elsewhere")

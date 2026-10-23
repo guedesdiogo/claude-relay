@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.2.2 — 2026-10-23
+
+- `claude-relay reset NAME` and `use NAME` now clear an exhausted mark on every machine. Before,
+  `watch` brought the mark back from the other machine on its next pass, 30 s later. Each mark
+  now records when it was made (`since`). Each machine records when each account's mark was last
+  cleared (`cleared`), and `watch` and the SSH hosts exchange these times. A mark older than the
+  account's last clear is dropped everywhere. A limit hit after the clear marks the account again.
+  A plain `reset` clears every configured account.
+- `claude-relay accounts add NAME` clears a "token rejected" mark for that account the same way.
+  Before, the account stayed skipped for a day on every machine, even after its new token was
+  saved. Usage-limit marks stay: a new token does not reset the limit.
+- After upgrading, run `claude-relay remote install HOST` again. Until then, `run` on the host still
+  writes marks without `since`, and the next clear of that account drops them.
+
 ## 2.2.1 — 2026-10-23
 
 - `claude-relay run` works as a drop-in for `claude` behind `alias claude='claude-relay run'`:

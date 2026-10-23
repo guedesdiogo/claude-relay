@@ -320,6 +320,33 @@ class WatchTests(unittest.TestCase):
         self.assertIn("1 session(s) stopped on the limit. Resume them by hand: the list is in "
                       f"{self.h.root / '.config' / 'claude-relay' / 'resume.json'}.", line)
 
+    def test_resume_list_that_cannot_be_written_does_not_stop_the_switch(self):
+        resume = self.h.root / ".config" / "claude-relay" / "resume.json"
+        resume.mkdir(parents=True)  # a folder where the file goes; state.json next to it still writes
+        r = self.switch_after_limit(quiet=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"Could not write {resume}", r.stdout)
+        self.assertIn("open -a Claude", self.desktop_log.read_text())
+        self.assertEqual(self.h.state()["watch"]["restored"], "acctB")
+        # No task: it would read a missing or older resume.json.
+        self.assertFalse((self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json").exists())
+        self.assertFalse((self.h.root / ".claude" / "scheduled-tasks" / "claude-relay-resume").exists())
+        # The notification names the sessions instead of the list that was not written.
+        line = next(l for l in r.stdout.splitlines() if "Sessions moved to" in l)
+        self.assertIn('1 session(s) stopped on the limit. Resume them by hand: "stopped on the limit".', line)
+        self.assertNotIn("resume.json", line)
+
+    def test_resume_list_that_cannot_be_written_without_stopped_sessions(self):
+        (self.h.root / ".config" / "claude-relay" / "resume.json").mkdir(parents=True)
+        self.h.relay("remote", "add", "devbox")
+        self.first_pass()
+        self.h.desktop_login("acctB")
+        (self.h.cards / "acctB" / "orgB").mkdir(parents=True)
+        r = self.h.watch()
+        self.assertIn("Could not write", r.stdout)
+        line = next(l for l in r.stdout.splitlines() if "Sessions moved to" in l)
+        self.assertTrue(line.endswith("0 session(s) stopped on the limit."), line)  # nothing to resume
+
     def test_no_resume_task_without_stopped_sessions(self):
         self.h.relay("remote", "add", "devbox")
         self.first_pass()

@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.2.5"
+__version__ = "2.2.6"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -1735,7 +1735,8 @@ def next_desktop_account(cfg, cards_root, current, exhausted, now):
 
 
 def write_resume_list(cfg, account, dest, pending):
-    """resume.json: the sessions to resume after moving them to `account` (card folder `dest`)."""
+    """resume.json: the sessions to resume after moving them to `account` (card folder `dest`).
+    Returns them and whether the file was written; a write that fails is logged."""
     cards = {}
     for f in dest.glob("local_*.json"):
         o = load_json(f)
@@ -1747,8 +1748,12 @@ def write_resume_list(cfg, account, dest, pending):
         if card:
             sessions.append({"sessionId": card.get("sessionId"), "cliSessionId": p["cli"], "title": card.get("title"),
                              "host": p["host"], "stoppedAt": p["ts"]})
-    write_json(RESUME_FILE, {"created": time.time(), "account": desktop_key(cfg, account), "sessions": sessions})
-    return sessions
+    try:
+        write_json(RESUME_FILE, {"created": time.time(), "account": desktop_key(cfg, account), "sessions": sessions})
+    except OSError as e:
+        wsay(f"Could not write {RESUME_FILE} ({e}).", "yellow")
+        return sessions, False
+    return sessions, True
 
 
 RESUME_TASK = "claude-relay-resume"
@@ -1909,9 +1914,9 @@ def watch_pass(cfg):
             if rc == 0:
                 stopped = {(h, c) for h, r in results.items() for c in r["stopped"]}
                 to_resume = [p for p in pending if p["account"] != account and (p["host"], p["cli"]) in stopped]
-                sessions = write_resume_list(cfg, account, DEFAULT_CARDS / account / org, to_resume)
-                added = True
-                if sessions:  # while the app is still closed, so it runs the task as it opens
+                sessions, listed = write_resume_list(cfg, account, DEFAULT_CARDS / account / org, to_resume)
+                added = listed
+                if listed and sessions:  # while the app is still closed, so it runs the task as it opens
                     added = register_resume_task(cfg, DEFAULT_CARDS / account / org)
                 open_desktop()
                 pending = [p for p in pending if p not in to_resume]
@@ -1922,7 +1927,11 @@ def watch_pass(cfg):
                 if added:
                     wsay(f"{msg} List: {RESUME_FILE}", "green")
                 else:  # they will not resume on their own
-                    msg += f" Resume them by hand: the list is in {RESUME_FILE}."
+                    if listed:
+                        msg += f" Resume them by hand: the list is in {RESUME_FILE}."
+                    elif sessions:  # no list to point at: name them
+                        titles = ", ".join(f'"{s["title"] or s["cliSessionId"]}"' for s in sessions)
+                        msg += f" Resume them by hand: {titles}."
                     wsay(msg, "yellow")
                 notify(cfg, "claude-relay", msg)
             else:

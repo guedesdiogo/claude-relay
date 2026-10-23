@@ -11,8 +11,11 @@
 - `claude-relay accounts add NAME` clears a "token rejected" mark for that account the same way.
   Before, the account stayed skipped for a day on every machine, even after its new token was
   saved. Usage-limit marks stay: a new token does not reset the limit.
-- After upgrading, run `claude-relay remote install HOST` again. Until then, `run` on the host still
-  writes marks without `since`, and the next clear of that account drops them.
+- After upgrading, take two steps:
+  - Run `claude-relay service install` to restart `watch`. The running agent keeps the old version
+    in memory, and it is the agent that sends the merge code to the hosts.
+  - Run `claude-relay remote install HOST` again. Until then, `run` on the host still writes marks
+    without `since`, and the next clear of that account drops them.
 
 ## 2.2.1 — 2026-10-23
 

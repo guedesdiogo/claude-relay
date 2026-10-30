@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -1771,7 +1771,7 @@ def scan_transcripts(projects_root, since, check=()):
             ts = to_epoch_ms(o.get("timestamp"), 0) / 1000
             if limit and ts >= since:
                 events.append({"uuid": o.get("uuid") or f"{cli}@{ts}", "cli": cli, "ts": ts,
-                               "until": limit[0], "window": limit[1]})
+                               "until": limit[0], "window": limit[1], "session": o.get("sessionId")})
     return {"events": events, "latest_write": latest, "stopped": stopped}
 
 
@@ -1845,6 +1845,29 @@ def desktop_account_at(history, ts):
             break
         found = account
     return found
+
+
+def card_versions(cards_root):
+    """{cliSessionId: {account: card_version}} for every Code-tab card, in every account."""
+    out = {}
+    for path in iter_cards(cards_root):
+        card = load_json(path)
+        if isinstance(card, dict) and card.get("cliSessionId"):
+            versions = out.setdefault(str(card["cliSessionId"]).lower(), {})
+            account = path.relative_to(cards_root).parts[0]
+            versions[account] = max(versions.get(account, (0, 0)), card_version(card))
+    return out
+
+
+def session_account(versions, signed_in):
+    """The account a session's limit error belongs to. A session that was running when Claude Desktop
+    switched accounts keeps the old account's token until it restarts, and only that account's card
+    follows it. So the account holding the session's newest card wins; on a tie, or with no card, the
+    account Claude Desktop was signed in to at the time (`signed_in`)."""
+    newest = max(versions.values(), default=None)
+    if newest is None or versions.get(signed_in) == newest:
+        return signed_in
+    return next(account for account, v in versions.items() if v == newest)
 
 
 def next_desktop_account(cfg, cards_root, current, exhausted, now):
@@ -1979,7 +2002,7 @@ def watch_pass(cfg):
     # Sessions still stopped on a limit stay pending; new limit errors add sessions and marks.
     pending = [p for p in pending if p["host"] not in results or p["cli"] in results[p["host"]]["stopped"]]
     seen = list(w.get("seen") or [])
-    seen_set, new_marks = set(seen), {}
+    seen_set, new_marks, cards = set(seen), {}, None
     for host, res in results.items():
         for ev in res.get("events") or []:
             if ev["uuid"] in seen_set:
@@ -1989,6 +2012,11 @@ def watch_pass(cfg):
             owner = desktop_account_at(history, ev["ts"])
             if not owner:
                 continue  # before `watch` knew which account was signed in
+            if cards is None:  # read once per pass, and only for a new error
+                cards = card_versions(DEFAULT_CARDS)
+            # A subagent's transcript is named after the agent; its lines carry the session's id.
+            versions = cards.get(ev["cli"].lower()) or cards.get(str(ev.get("session") or "").lower()) or {}
+            owner = session_account(versions, owner)
             if not any(p["host"] == host and p["cli"] == ev["cli"] for p in pending):
                 pending.append({"host": host, "cli": ev["cli"], "account": owner, "ts": ev["ts"]})
             until = ev.get("until") or ev["ts"] + 60 * int(cfg.get("cooldown_minutes") or 30)

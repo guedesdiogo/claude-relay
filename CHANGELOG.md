@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.3.1 — 2026-10-30
+
+- A usage limit hit just after you switch Claude Desktop to another account is now charged to the
+  account the session was running on. A session that was running at the switch, such as one woken
+  by a background task on an SSH host, keeps the old account's token until it restarts. Until now
+  `watch` marked the new account as exhausted, with the old account's reset time. So
+  `claude-relay run` skipped an account that was still free, and the notification told you to sign
+  Claude Desktop in to yet another account.
+  - Each limit error now belongs to the account that holds the session's newest card
+    (`lastActivityAt`, then `latestUserFrameAt`). Only the account the session went on in updates
+    its card. A subagent's transcript is named after the agent, so its error is matched by the
+    `sessionId` on its lines. With no card, or the same activity in two accounts, the error belongs
+    to the account Claude Desktop was signed in to at that moment, as before.
+  - A session stopped on the old account's limit now waits for the move under that account. After
+    the move it goes into `resume.json` and is resumed. Until now it was filed under the new account
+    and left out.
+- To lift a wrong mark from before this version, run `claude-relay reset NAME`.
+
 ## 2.3.0 — 2026-10-23
 
 - `claude-relay desktop` (and `watch` when it moves the sessions) now brings the sessions this

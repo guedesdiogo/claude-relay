@@ -381,7 +381,10 @@ Remote helpers live in `~/.claude/remote/` on each SSH host.
 `"entrypoint": "claude-desktop"`, `"error": "rate_limit"` and `"quotaLimits": {"status": "rejected",
 "resetsAt": …}` (verified with Claude Code 2.1.299). Temporary capacity errors are ignored, and so
 are terminal sessions, which `claude-relay run` already handles. Each error belongs to the account
-Claude Desktop was signed in to at that moment. Marks are merged between machines, and the later
+that holds the session's newest card: a session that was running when Claude Desktop switched
+accounts keeps the old account's token until it restarts, and only that account's card follows it.
+With no card, or the same activity in two accounts, it belongs to the account Claude Desktop was
+signed in to at that moment. Marks are merged between machines, and the later
 reset wins. Each mark records when it was made (`since`). Each machine records when each account's
 mark was last cleared (`cleared`). Marks older than the account's last clear are dropped. Marks from
 before 2.2.2 have no `since` and count as older.

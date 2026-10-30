@@ -311,6 +311,35 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.h.state()["exhausted"]["acctA"]["until"], resets)
         self.assertEqual(self.h.state(remote=True)["exhausted"]["acctA"]["until"], resets)
 
+    def test_a_limit_after_a_switch_belongs_to_the_account_the_session_went_on_in(self):
+        # A session running when Claude Desktop switched keeps the old account's token until it
+        # restarts, and only that account's card follows it.
+        self.first_pass()
+        t = time.time()
+        self.h.transcript("S2", [user_entry(t), reply_entry(t)], age=1)  # still writing: no move yet
+        self.h.desktop_login("acctB")
+        self.h.add_card("acctB", "orgB", "N1", title="started after the switch")
+        self.h.add_card("acctA", "orgA", "S3", last=2000)
+        self.h.add_card("acctB", "orgB", "S3", last=1000)  # an older copy from an earlier move
+        self.h.add_card("acctB", "orgB", "S2")  # the same copy in both accounts
+        r = self.h.watch()  # sees the switch
+        self.assertIn("waiting until no session has written", r.stdout)
+        t = time.time()
+        resets_a, resets_b = int(t + 3600), int(t + 7200)
+        for cli in ("S1", "S3"):
+            self.h.transcript(cli, [limit_entry(t + 1, resets_a)], age=1)
+        for cli in ("N1", "S2"):
+            self.h.transcript(cli, [limit_entry(t + 1, resets_b)], age=1)
+        subagent = dict(limit_entry(t + 1, resets_a), sessionId="S1", isSidechain=True)
+        self.h.transcript("agent-a1", [subagent], age=1)  # named after the agent, not the session
+        r = self.h.watch()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        st = self.h.state()
+        self.assertEqual({p["cli"]: p["account"] for p in st["watch"]["pending"]},
+                         {"S1": "acctA", "S3": "acctA", "agent-a1": "acctA", "N1": "acctB", "S2": "acctB"})
+        self.assertEqual({name: m["until"] for name, m in st["exhausted"].items()},
+                         {"acctA": resets_a, "acctB": resets_b})
+
     def test_publishes_the_claude_desktop_account_everywhere(self):
         self.h.relay("accounts", "link", "work", "acctA")
         self.h.relay("remote", "add", "devbox")

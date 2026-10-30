@@ -1,6 +1,6 @@
 {
   "name": "@guedesdiogo/claude-relay",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Use several Claude subscriptions as one: automatic account failover for Claude Code in the terminal, and session migration for Claude Desktop.",
   "keywords": [
     "claude",

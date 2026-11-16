@@ -1492,20 +1492,21 @@ def update_archive_index(dest, archived):
 
 
 def foreign_artifacts(cards, account, history):
-    """The artifacts in `account`'s open cards that another account published, as [(owner, card, entry)].
+    """The artifacts in `account`'s open cards ({sessionId: card}.items()) that another account published,
+    as [(owner, sessionId, card, entry)].
     claude.ai keeps an artifact in the account that published it, so `account` cannot open or update
     them. An entry belongs to the account Claude Desktop was signed in to at its updatedAt (ms), from
     `watch`'s history; one from before that history has no known owner and is left out."""
     out = []
-    for card in cards:
-        if not isinstance(card, dict) or card.get("isArchived"):
+    for sid, card in cards:
+        if card.get("isArchived"):
             continue
         for entry in card.get("publishedArtifacts") or []:
             if not isinstance(entry, dict) or not isinstance(entry.get("updatedAt"), (int, float)):
                 continue
             owner = desktop_account_at(history, entry["updatedAt"] / 1000)
             if owner and owner != account:
-                out.append((owner, card, entry))
+                out.append((owner, sid, card, entry))
     return out
 
 
@@ -1638,11 +1639,14 @@ def cmd_desktop(args):
     # A session deleted here counts as present (None), so neither copying nor the transcript scan
     # brings it back.
     have, by_id = {}, {}
+    cards = {}  # sessionId -> this account's card, then the one this run writes (or would write)
     if dest.exists():
         for d in deleted_ids(dest):
             have[d.lower()] = by_id[f"local_{d}"] = None
         for f in dest.glob("local_*.json"):
             o = load_json(f)
+            if isinstance(o, dict):
+                cards[o.get("sessionId") or f.stem] = o
             if isinstance(o, dict) and o.get("cliSessionId"):
                 have[str(o["cliSessionId"]).lower()] = f
                 by_id[o.get("sessionId") or f.stem] = f
@@ -1651,7 +1655,6 @@ def cmd_desktop(args):
     sources = [(f, o) for f, o in sources if isinstance(o, dict) and o.get("cliSessionId")]
     copied = updated = archived = 0
     archive_state = {}  # sessionId -> isArchived of the cards written, for archived-sessions.idx
-    written = {}  # sessionId -> card written, or that this dry run would write
     for f, o in sorted(sources, key=lambda s: card_version(s[1]), reverse=True):  # newest copy first
         key, sid = str(o["cliSessionId"]).lower(), o.get("sessionId") or f.stem
         if sid in by_id or key in have:
@@ -1660,7 +1663,7 @@ def cmd_desktop(args):
                 result, card = sync_card(o, match, args.dry_run)
                 if result:
                     archive_state[card.get("sessionId") or match.stem] = bool(card.get("isArchived"))
-                    written[card.get("sessionId") or match.stem] = card
+                    cards[card.get("sessionId") or match.stem] = card
                 updated += result == "updated"
                 archived += result == "archived"
                 have.setdefault(key, match)  # its transcript has a card now
@@ -1672,7 +1675,7 @@ def cmd_desktop(args):
             shutil.copy2(f, target)
         have[key] = by_id[sid] = target if not args.dry_run else None
         archive_state[sid] = bool(o.get("isArchived"))
-        written[sid] = o
+        cards[sid] = o
         copied += 1
     if not args.dry_run:
         update_archive_index(dest, archive_state)
@@ -1740,21 +1743,15 @@ def cmd_desktop(args):
         cfg = load_config()
         history = [h for h in (load_state().get("watch") or {}).get("history") or []
                    if isinstance(h, list) and len(h) == 2]
-        cards = {}  # this account's cards once the copy is done
-        for p in dest.glob("local_*.json") if dest.exists() else []:
-            o = load_json(p)
-            if isinstance(o, dict):
-                cards[o.get("sessionId") or p.stem] = o
-        cards.update(written)
-        foreign = foreign_artifacts(cards.values(), acct, history)
+        foreign = foreign_artifacts(cards.items(), acct, history)
         if foreign:
-            say(f"{len(foreign)} artifact(s) in {len({id(c) for _, c, _ in foreign})} open session(s) were "
+            say(f"{len(foreign)} artifact(s) in {len({sid for _, sid, _, _ in foreign})} open session(s) were "
                 f"published by another account. claude.ai keeps an artifact in the account that published "
                 f"it, so signed in as {desktop_key(cfg, acct)} these sessions cannot open or update them. "
                 "Share each one with this account on claude.ai, or continue the session in the account "
                 "named here:", "yellow")
-            foreign.sort(key=lambda x: (desktop_key(cfg, x[0]), str(x[1].get("title"))))
-            for owner, card, entry in foreign:
+            foreign.sort(key=lambda x: (desktop_key(cfg, x[0]), str(x[2].get("title"))))
+            for owner, _, card, entry in foreign:
                 say(f'  {desktop_key(cfg, owner)}: "{card.get("title") or card.get("cliSessionId")}" · '
                     f'{entry.get("title") or "untitled"} · {entry.get("url")}', "white")
 

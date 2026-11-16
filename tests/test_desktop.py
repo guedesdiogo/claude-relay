@@ -300,12 +300,17 @@ class DesktopTests(unittest.TestCase):
         self.h.add_card("acctB", "orgB", "S8", title="mine", last=2600000, publishedArtifacts=[art("mine", 2500000)])
         self.h.add_card("acctB", "orgB", "S9", title="old", last=1600000, isArchived=True,
                         publishedArtifacts=[art("shelved", 1500000)])
+        # An older copy here that the other account's newer card replaces.
+        self.h.add_card("acctB", "orgB", "S6", title="went on in A", last=1000000)
+        self.h.add_card("acctA", "orgA", "S6", title="went on in A", last=1700000,
+                        publishedArtifacts=[art("updated", 1650000)])
         self.h.desktop_login("acctB")
         for args in (["--dry-run"], []):  # the dry run lists the card it would copy
             r = self.h.run("--existing-cards-only", *args)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertIn("1 artifact(s) in 1 open session(s) were published by another account.", r.stdout)
+            self.assertIn("2 artifact(s) in 2 open session(s) were published by another account.", r.stdout)
             self.assertIn('alpha: "weekly report" · Froma · https://claude.ai/artifact/froma', r.stdout)
+            self.assertIn('alpha: "went on in A" · Updated · https://claude.ai/artifact/updated', r.stdout)
             for left_out in ("artifact/mine", "artifact/shelved", "artifact/early"):
                 self.assertNotIn(left_out, r.stdout)
 

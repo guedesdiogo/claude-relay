@@ -46,7 +46,9 @@ What the files showed:
 ## Left open
 
 - `watch` keeps the last 20 switches, so older artifacts end up with no known owner and are not listed.
-- If `watch` moves the sessions in the same pass that first sees the new account, history does not
-  have that switch yet. An artifact published in the new account up to 30 s earlier would count as
-  the previous account's.
+- History records a switch when `watch` first sees it, not when you signed in. An artifact published
+  in the new account before that (up to 30 s with `watch` running; longer if it was stopped or the
+  Mac slept), or in the same pass that moves the sessions, counts as the previous account's.
+- A session that was running at a switch keeps the old account's token until it restarts (see
+  2.3.1). An artifact it publishes then belongs to the old account but counts as the new one's.
 - The `watch` notification does not mention these artifacts. `watch.log` has `desktop`'s output.

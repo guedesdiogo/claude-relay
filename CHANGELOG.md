@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.3.2 — 2026-11-16
+
+- `claude-relay desktop` (and `watch` when it moves the sessions, in `watch.log`) now lists the
+  artifacts in this account's open sessions that another account published. An artifact lives on
+  claude.ai, in the account that published it. Signed in to another account, the session cannot open
+  or update it: it drops the link, and publishing again makes a new page. claude-relay cannot move
+  or share artifacts. The list gives each artifact's account, the session and the link: share the
+  artifact with this account on claude.ai, or continue the session in that account.
+  - An artifact belongs to the account Claude Desktop was signed in to when it was last published
+    (`updatedAt` in the card's `publishedArtifacts`), taken from `watch`'s record of switches.
+    Artifacts from before that record are left out. `--dry-run` shows the list without copying.
+- The README lists artifacts under "What stays per account".
+
 ## 2.3.1 — 2026-10-30
 
 - A usage limit hit just after you switch Claude Desktop to another account is now charged to the

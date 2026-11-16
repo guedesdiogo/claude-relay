@@ -281,6 +281,48 @@ class DesktopTests(unittest.TestCase):
                       "archived 1 archived in another account.", r.stdout)
         self.assertEqual(self.h.cards_of("acctA", "orgA"), before)
 
+    def watch_history(self, history):
+        """`accounts link` names and the Claude Desktop accounts `watch` saw signed in, as [[epoch s, id]]."""
+        cfg = self.h.root / ".config" / "claude-relay"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "config.json").write_text(json.dumps({"accounts": [
+            {"name": "alpha", "desktop_account": "acctA"}, {"name": "beta", "desktop_account": "acctB"}]}))
+        (cfg / "state.json").write_text(json.dumps({"watch": {"history": history}}))
+
+    def test_artifacts_published_by_another_account_are_listed(self):
+        # claude.ai keeps an artifact in the account that published it: signed in to B, a session
+        # copied from A cannot open or update A's artifacts. Its updatedAt (ms) tells whose it is.
+        self.watch_history([[1000, "acctA"], [2000, "acctB"]])
+        art = lambda name, at: {"url": f"https://claude.ai/artifact/{name}", "title": name.title(),
+                                "sourcePath": f"/tmp/{name}.html", "updatedAt": at}
+        self.h.add_card("acctA", "orgA", "S7", title="weekly report", last=1600000,
+                        publishedArtifacts=[art("froma", 1500000), art("early", 500000)])
+        self.h.add_card("acctB", "orgB", "S8", title="mine", last=2600000, publishedArtifacts=[art("mine", 2500000)])
+        self.h.add_card("acctB", "orgB", "S9", title="old", last=1600000, isArchived=True,
+                        publishedArtifacts=[art("shelved", 1500000)])
+        # An older copy here that the other account's newer card replaces.
+        self.h.add_card("acctB", "orgB", "S6", title="went on in A", last=1000000)
+        self.h.add_card("acctA", "orgA", "S6", title="went on in A", last=1700000,
+                        publishedArtifacts=[art("updated", 1650000)])
+        self.h.desktop_login("acctB")
+        for args in (["--dry-run"], []):  # the dry run lists the card it would copy
+            r = self.h.run("--existing-cards-only", *args)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("2 artifact(s) in 2 open session(s) were published by another account.", r.stdout)
+            self.assertIn('alpha: "weekly report" · Froma · https://claude.ai/artifact/froma', r.stdout)
+            self.assertIn('alpha: "went on in A" · Updated · https://claude.ai/artifact/updated', r.stdout)
+            for left_out in ("artifact/mine", "artifact/shelved", "artifact/early"):
+                self.assertNotIn(left_out, r.stdout)
+
+    def test_artifacts_are_not_listed_without_watch_history(self):
+        self.h.add_card("acctA", "orgA", "S7", last=1600000, publishedArtifacts=[
+            {"url": "https://claude.ai/artifact/froma", "title": "Froma", "updatedAt": 1500000}])
+        self.h.desktop_login("acctB")
+        (self.h.cards / "acctB" / "orgB").mkdir(parents=True)
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("artifact", r.stdout)
+
     def test_recurring_scheduled_tasks_follow_the_account(self):
         daily = {"id": "daily", "displayName": "Daily", "cronExpression": "30 8 * * *", "enabled": True,
                  "filePath": "/Users/x/.claude/scheduled-tasks/daily/SKILL.md", "createdAt": 100,

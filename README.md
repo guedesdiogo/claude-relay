@@ -194,10 +194,20 @@ change you make to a task (its schedule, turning it off) stays in the account wh
 and a task you delete in one account comes back from the others on the next switch, so delete it
 in each account.
 
-**What stays per account:** usage limits, one-time scheduled tasks, claude.ai connectors and cloud
-sessions (Claude Code on the web). Unarchiving is per account too: a session you unarchive without
-continuing it is archived again from the other account on the next switch. Send it a message to
-keep it open everywhere.
+**What stays per account:** usage limits, one-time scheduled tasks, claude.ai connectors, cloud
+sessions (Claude Code on the web) and artifacts. Unarchiving is per account too: a session you
+unarchive without continuing it is archived again from the other account on the next switch. Send
+it a message to keep it open everywhere.
+
+**Artifacts:** a page a session publishes lives on claude.ai, in the account that published it, and
+is private. The session's card keeps the link in every account, but signed in to another account the
+session cannot open or update the page: the Artifact tool answers "not shared with you" or "no
+longer have write access" and drops the link, and publishing again makes a new page at a new link.
+claude-relay cannot move or share artifacts. After copying, `desktop` lists the artifacts in this
+account's open sessions that another account published, with the account and the link. It knows the
+account from `watch`'s record of switches, so artifacts from before `watch` started are not listed.
+For each one, share it with this account on claude.ai, or continue the session in the account that
+owns it.
 
 ---
 

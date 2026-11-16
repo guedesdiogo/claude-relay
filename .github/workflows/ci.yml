@@ -18,6 +18,13 @@ jobs:
         os: [macos-latest, ubuntu-latest]
         # 3.9 is the version shipped with Apple's Command Line Tools
         python: ["3.9", "3.13"]
+        # setup-python has no 3.9 build for Ubuntu 26.04 (ubuntu-latest since November 2026)
+        exclude:
+          - os: ubuntu-latest
+            python: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python: "3.9"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

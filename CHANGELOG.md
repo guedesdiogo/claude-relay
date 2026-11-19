@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.3 — 2026-11-19
+
+- `watch`'s resume task now actually resumes the sessions. Until now it sent no message in any run:
+  a scheduled run that nobody opened cannot reach another session with `SendMessage`, and
+  `send_message` waited for an approval that nobody was there to give. The task is now saved in Auto
+  permission mode, as Claude Desktop saves a task created in it, and sends with `send_message`. If
+  Auto mode is not available to the account, the run still cannot send.
+- A session that stopped on the limit stays on the list until its transcript no longer ends on the
+  limit. Until now it left the list at the move, so if you switched Claude Desktop again before the
+  resume task ran, the next list left it out and it stayed stopped. If it stops again on the account
+  it was moved to, it now counts as that account's.
+- Only the account the resume list is for keeps the resume task: a move removes it from the other
+  accounts. A task that had not run would otherwise fire at a later sign-in to that account and
+  message the sessions of a list written for another one.
+
 ## 2.3.2 — 2026-11-16
 
 - `claude-relay desktop` (and `watch` when it moves the sessions, in `watch.log`) now lists the

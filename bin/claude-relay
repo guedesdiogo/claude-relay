@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.3.2"
+__version__ = "2.3.3"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -1952,7 +1952,9 @@ def register_resume_task(cfg, dest):
     Claude Desktop keeps each task's prompt in ~/.claude/scheduled-tasks/<id>/SKILL.md and, per
     account, {"scheduledTasks": [{"id", "fireAt": <epoch ms>, "enabled", "filePath", "cwd", ...}]} in
     scheduled-tasks.json (format observed in Claude Desktop, October 2026). The task runs in
-    RELAY_HOME so it reads resume.json without a permission prompt. A scheduled-tasks.json that exists
+    RELAY_HOME so it reads resume.json without a permission prompt. Nobody opens the run, so it is
+    saved in Auto mode, with the two fields Claude Desktop writes for a task saved in it (observed
+    November 2026): a run in a mode that asks first cannot send. A scheduled-tasks.json that exists
     but cannot be read is left alone, with a warning; so is a write that fails. Returns whether the task
     was added."""
     path = dest / "scheduled-tasks.json"
@@ -1973,18 +1975,21 @@ def register_resume_task(cfg, dest):
             f"1. Read `resume.json` in the current folder ({RELAY_HOME}). Its `sessions` list has a `sessionId` "
             "and a `title` for each session to resume.\n"
             "2. Call `list_sessions` (limit 100) and leave out any of those sessions that is already running.\n"
-            "3. Send each remaining session this message with `SendMessage` (`to` = its sessionId), word for "
-            "word:\n\n"
+            "3. Send each remaining session this message with `mcp__ccd_session_mgmt__send_message` "
+            "(`session_id` = its sessionId; load the tool with ToolSearch first), word for word:\n\n"
             f"   {cfg.get('resume_prompt') or DEFAULT_CONFIG['resume_prompt']}\n\n"
             f"   Send at most {RESUME_WAVE} at a time; before the next {RESUME_WAVE}, call `list_sessions` again "
-            f"and wait until fewer than {RESUME_WAVE} of them are running.\n"
-            "4. Do nothing else: do not run commands, edit files or answer for the sessions. Finish with one line: "
-            "how many sessions you messaged and which ones you skipped.\n",
+            f"and wait until fewer than {RESUME_WAVE} of them are running. Do not use `SendMessage`: it cannot "
+            "reach another session from a scheduled run.\n"
+            "4. Do nothing else: message only the sessions listed in `resume.json`, and do not run commands, edit "
+            "files or answer for the sessions. Finish with one line: how many sessions you messaged and which "
+            "ones you skipped.\n",
             encoding="utf-8")
         tasks = [t for t in data.get("scheduledTasks") or [] if isinstance(t, dict) and t.get("id") != RESUME_TASK]
         now_ms = int(time.time() * 1000)
         tasks.append({"id": RESUME_TASK, "displayName": "claude-relay: resume sessions", "fireAt": now_ms,
-                      "enabled": True, "filePath": str(skill), "createdAt": now_ms, "cwd": str(RELAY_HOME)})
+                      "enabled": True, "filePath": str(skill), "createdAt": now_ms, "cwd": str(RELAY_HOME),
+                      "permissionMode": "auto", "permissionModeCarried": True})
         data["scheduledTasks"] = tasks
         write_json(path, data)  # 0600, like Claude Desktop's own copy
     except OSError as e:
@@ -1992,6 +1997,25 @@ def register_resume_task(cfg, dest):
              f"{RESUME_FILE} by hand.", "yellow")
         return False
     return True
+
+
+def drop_resume_tasks(cards_root, keep=None):
+    """Remove the resume task from every account's scheduled-tasks.json but `keep` (a card folder).
+    A task that did not run before the next switch would fire at a later sign-in to that account and
+    read a resume.json written for another one. Files that cannot be read or written are left alone."""
+    for path in cards_root.glob("*/*/scheduled-tasks.json"):
+        if keep is not None and path.parent == keep:
+            continue
+        data = load_json(path)
+        tasks = data.get("scheduledTasks") if isinstance(data, dict) else None
+        if not isinstance(tasks, list) or not any(isinstance(t, dict) and t.get("id") == RESUME_TASK
+                                                  for t in tasks):
+            continue
+        data["scheduledTasks"] = [t for t in tasks if not (isinstance(t, dict) and t.get("id") == RESUME_TASK)]
+        try:
+            write_json(path, data)
+        except OSError:
+            pass
 
 
 def wsay(msg, color="gray"):
@@ -2055,8 +2079,11 @@ def watch_pass(cfg):
             # A subagent's transcript is named after the agent; its lines carry the session's id.
             versions = cards.get(ev["cli"].lower()) or cards.get(str(ev.get("session") or "").lower()) or {}
             owner = session_account(versions, owner)
-            if not any(p["host"] == host and p["cli"] == ev["cli"] for p in pending):
+            known = next((p for p in pending if p["host"] == host and p["cli"] == ev["cli"]), None)
+            if known is None:
                 pending.append({"host": host, "cli": ev["cli"], "account": owner, "ts": ev["ts"]})
+            elif ev["ts"] >= (known.get("ts") or 0):  # stopped again, on the account it was moved to
+                known.update(account=owner, ts=ev["ts"])
             until = ev.get("until") or ev["ts"] + 60 * int(cfg.get("cooldown_minutes") or 30)
             name = desktop_key(cfg, owner)
             # A limit from before the account was cleared stays cleared, even when first seen now.
@@ -2107,12 +2134,16 @@ def watch_pass(cfg):
             if rc == 0:
                 stopped = {(h, c) for h, r in results.items() for c in r["stopped"]}
                 to_resume = [p for p in pending if p["account"] != account and (p["host"], p["cli"]) in stopped]
-                sessions, listed = write_resume_list(cfg, account, DEFAULT_CARDS / account / org, to_resume)
+                dest = DEFAULT_CARDS / account / org
+                sessions, listed = write_resume_list(cfg, account, dest, to_resume)
                 added = listed
-                if listed and sessions:  # while the app is still closed, so it runs the task as it opens
-                    added = register_resume_task(cfg, DEFAULT_CARDS / account / org)
+                if listed:  # while the app is still closed: only the new list's account keeps a task
+                    drop_resume_tasks(DEFAULT_CARDS, keep=dest if sessions else None)
+                if listed and sessions:  # so the app runs the task as it opens
+                    added = register_resume_task(cfg, dest)
                 open_desktop()
-                pending = [p for p in pending if p not in to_resume]
+                # They stay pending until their transcript no longer ends on the limit, so a session the
+                # task did not resume (the account changed again first) goes into the next list too.
                 w["restored"] = account
                 for k in ("waiting_for", "failures", "retry_at"):
                     w.pop(k, None)

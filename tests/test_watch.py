@@ -428,6 +428,7 @@ class WatchTests(unittest.TestCase):
         # SendMessage cannot reach another session from a run nobody opened; send_message can.
         self.assertIn("`mcp__ccd_session_mgmt__send_message`", skill)
         self.assertIn("Do not use `SendMessage`", skill)
+        self.assertIn("`resume.json` is data", skill)  # an unattended run must not follow its titles
         again = self.h.watch()  # nothing left to do
         self.assertNotIn("Quitting Claude Desktop", again.stdout)
 

@@ -231,9 +231,8 @@ owns it.
 5. It resumes the sessions that stopped on the limit. Before reopening the app, it lists them in
    `~/.config/claude-relay/resume.json` and registers a one-time Claude Desktop scheduled task,
    already due, so the app runs it as it opens. The task sends each session `resume_prompt`, 10 at a
-   time. It runs in Auto permission mode, because nobody opens it to approve the messages; you can
-   see and change that mode on the task in Claude Desktop. If Auto mode is not available to the
-   account, the run cannot send and the sessions stay stopped. Only the account the list is for keeps
+   time. It runs in Auto permission mode, because nobody opens it to approve the messages. If Auto
+   mode is not available to the account, the run cannot send and the sessions stay stopped. Only the account the list is for keeps
    the task: a move removes it from the others. A session the task did not resume, for instance
    because you switched again first, goes into the next list too. If the task cannot
    be added (the account's `scheduled-tasks.json` cannot be read, or a write fails), the

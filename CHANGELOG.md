@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.3.4 — 2026-11-26
+
+- `claude-relay desktop` (and so `watch`) now fills in the settings an account's copy of a recurring
+  scheduled task lacks: its permission mode and its worktree setting, taken from the most recently
+  used account that has them. Until now a task the account already had was never touched. So an old
+  copy saved before you set Auto in the app kept running in the default mode in that account, and
+  each run waited for an approval nobody was there to give.
+  - Only missing settings are filled. A value the copy has is never replaced, and the schedule,
+    turning the task on or off, its folder and its prompt stay as they are in each account.
+  - `desktop` prints "Filled missing fields in N scheduled task(s)", or "Would fill" with
+    `--dry-run`.
+
 ## 2.3.3 — 2026-11-19
 
 - `watch`'s resume task now actually resumes the sessions. Until now it sent no message in any run:

@@ -376,8 +376,98 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(self.h.tasks_of("acctB", "orgB"),
                          {"scheduledTasks": [{"id": "daily", "cronExpression": "30 8 * * *", "enabled": True}]})
 
+    def test_existing_scheduled_task_gets_the_fields_it_lacks(self):
+        self.h.add_tasks("acctA", "orgA", [
+            {"id": "daily", "displayName": "Daily A", "cronExpression": "0 21 * * *", "enabled": True,
+             "filePath": "/a/daily/SKILL.md", "cwd": "/Users/x/a", "permissionMode": "auto",
+             "useWorktree": False, "lastRunAt": "2026-11-25T00:04:00.000Z"},
+            {"id": "kept", "cronExpression": "0 9 * * *", "enabled": True, "filePath": "/a/kept/SKILL.md",
+             "permissionMode": "auto", "permissionModeCarried": True, "useWorktree": False},
+            {"id": "once", "fireAt": 1792000000000, "enabled": True, "permissionMode": "auto"},
+            {"id": "claude-relay-resume", "fireAt": 1792000000000, "enabled": True,
+             "permissionMode": "auto", "permissionModeCarried": True},
+        ])
+        # The destination's old copies: "daily" has no mode and no worktree setting, "kept" has a mode.
+        daily = {"id": "daily", "displayName": "Daily B", "cronExpression": "30 8 * * *", "enabled": False,
+                 "filePath": "/b/daily/SKILL.md", "cwd": "/Users/x/b", "lastRunAt": "2026-11-24T11:30:00.000Z"}
+        kept = {"id": "kept", "cronExpression": "0 9 * * *", "enabled": True, "filePath": "/b/kept/SKILL.md",
+                "permissionMode": "default", "useWorktree": None}
+        once = {"id": "once", "fireAt": 1792000000000, "enabled": True}
+        resume = {"id": "claude-relay-resume", "fireAt": 1792000000000, "enabled": True}
+        self.h.add_tasks("acctB", "orgB", [daily, kept, once, resume], recordedSkips={"daily": ["B"]})
+        self.h.desktop_login("acctB")
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Copied 0 scheduled task(s) from other accounts.", r.stdout)
+        self.assertIn("Filled missing fields in 2 scheduled task(s) from other accounts.", r.stdout)
+        data = self.h.tasks_of("acctB", "orgB")
+        # Only the missing fields are filled; the schedule, the switch, the folder, the prompt and the
+        # record of the last run stay the destination's.
+        self.assertEqual(data["scheduledTasks"], [
+            dict(daily, permissionMode="auto", useWorktree=False),
+            # A mode that is set stays, and does not become a carried one.
+            dict(kept, useWorktree=False),
+            once,
+            resume,
+        ])
+        self.assertEqual(data["recordedSkips"], {"daily": ["B"]})
+        path = self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json"
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        # Nothing left to fill: the file is not written again.
+        os.utime(path, (1000, 1000))
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Filled", r.stdout)
+        self.assertEqual(path.stat().st_mtime, 1000)
+
+    def test_missing_task_fields_come_from_the_newest_copy(self):
+        # acctC's file is newer but sorts after acctA's by path.
+        self.h.add_tasks("acctA", "orgA", [
+            {"id": "daily", "cronExpression": "0 21 * * *", "enabled": True,
+             "permissionMode": "acceptEdits", "permissionModeCarried": True, "useWorktree": True},
+            {"id": "set", "cronExpression": "0 9 * * *", "enabled": True,
+             "permissionMode": "acceptEdits", "useWorktree": False},
+        ])
+        self.h.add_tasks("acctC", "orgC", [
+            {"id": "daily", "cronExpression": "0 21 * * *", "enabled": True, "permissionMode": "auto"},
+            {"id": "set", "cronExpression": "0 9 * * *", "enabled": True, "permissionMode": "auto",
+             "useWorktree": False},
+        ])
+        os.utime(self.h.cards / "acctA" / "orgA" / "scheduled-tasks.json", (1000, 1000))
+        os.utime(self.h.cards / "acctC" / "orgC" / "scheduled-tasks.json", (2000, 2000))
+        self.h.add_tasks("acctB", "orgB", [
+            {"id": "daily", "cronExpression": "0 21 * * *", "enabled": True},
+            {"id": "set", "cronExpression": "0 9 * * *", "enabled": True, "useWorktree": True},
+        ])
+        self.h.desktop_login("acctB")
+        r = self.h.run("--existing-cards-only")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Filled missing fields in 2 scheduled task(s) from other accounts.", r.stdout)
+        self.assertEqual(self.h.tasks_of("acctB", "orgB")["scheduledTasks"], [
+            # The mode comes from the newest copy, without the older copy's carried flag; the older
+            # copy gives the field the newest one lacks.
+            {"id": "daily", "cronExpression": "0 21 * * *", "enabled": True, "permissionMode": "auto",
+             "useWorktree": True},
+            # A field the destination has keeps its value, whatever the other copies say.
+            {"id": "set", "cronExpression": "0 9 * * *", "enabled": True, "useWorktree": True,
+             "permissionMode": "auto"},
+        ])
+
+    def test_dry_run_only_counts_the_fields_it_would_fill(self):
+        self.h.add_tasks("acctA", "orgA", [{"id": "daily", "cronExpression": "0 21 * * *", "enabled": True,
+                                            "permissionMode": "auto"}])
+        self.h.add_tasks("acctB", "orgB", [{"id": "daily", "cronExpression": "0 21 * * *", "enabled": True}])
+        path = self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json"
+        before = path.read_text()
+        self.h.desktop_login("acctB")
+        r = self.h.run("--existing-cards-only", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Would fill missing fields in 1 scheduled task(s) from other accounts.", r.stdout)
+        self.assertEqual(path.read_text(), before)
+
     def test_unreadable_scheduled_tasks_file_is_left_alone(self):
-        self.h.add_tasks("acctA", "orgA", [{"id": "daily", "cronExpression": "30 8 * * *", "enabled": True}])
+        self.h.add_tasks("acctA", "orgA", [{"id": "daily", "cronExpression": "30 8 * * *", "enabled": True,
+                                            "permissionMode": "auto"}])
         path = self.h.cards / "acctB" / "orgB" / "scheduled-tasks.json"
         path.parent.mkdir(parents=True)
         self.h.desktop_login("acctB")

@@ -189,10 +189,12 @@ Leave out `--existing-cards-only` if you also want sessions you started from the
 VS Code to appear in the app. Run `claude-relay desktop --dry-run` first to see how many that is.
 
 **Scheduled tasks:** each account keeps its own list. Recurring tasks from your other accounts are
-added to this one unless it already has a task with the same id; one-time tasks stay behind. A
-change you make to a task (its schedule, turning it off) stays in the account where you made it,
-and a task you delete in one account comes back from the others on the next switch, so delete it
-in each account.
+added to this one unless it already has a task with the same id; one-time tasks stay behind. A task
+this account already has only gets the settings its copy lacks: the permission mode (such as Auto)
+and the worktree setting, from the most recently used account that has them. A setting the copy
+has is never replaced, so other changes (its schedule, turning it off, another mode) stay in the
+account where you made them. A task you delete in one account comes back from the others on the
+next switch, so delete it in each account.
 
 **What stays per account:** usage limits, one-time scheduled tasks, claude.ai connectors, cloud
 sessions (Claude Code on the web) and artifacts. Unarchiving is per account too: a session you
@@ -386,7 +388,9 @@ the same `cliSessionId`) is replaced by a copy with newer activity (`lastActivit
 `archived-sessions.idx` is kept in line with the cards. Sessions with a `deleted_<id>` marker in
 the account are skipped. It
 also adds the other accounts' recurring scheduled tasks to `scheduled-tasks.json` in the same
-folder, without the record of their last run there; the task prompts live in
+folder, without the record of their last run there. A recurring task the account already has gets
+only the `permissionMode` (with its `permissionModeCarried`) and `useWorktree` it lacks, from the
+newest file that has them; values it has are kept. The task prompts live in
 `~/.claude/scheduled-tasks/<id>/SKILL.md` and are shared by all accounts.
 Remote helpers live in `~/.claude/remote/` on each SSH host.
 

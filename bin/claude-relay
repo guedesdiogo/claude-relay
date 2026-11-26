@@ -43,7 +43,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "2.3.3"
+__version__ = "2.3.4"
 
 PROG = "claude-relay"
 HOME = Path.home()
@@ -1517,30 +1517,48 @@ def copy_scheduled_tasks(cards_root, dest, dry_run):
     """Add the recurring Claude Desktop scheduled tasks of other accounts to `dest`'s scheduled-tasks.json.
 
     The prompts in ~/.claude/scheduled-tasks are shared, but each account registers its own tasks (see
-    register_resume_task). Tasks `dest` already has stay as they are; one-time tasks and the record of
-    a task's last run in the other account are left behind. Returns how many tasks were copied, or None
-    when `dest`'s file exists but cannot be read."""
+    register_resume_task). One-time tasks and the record of a task's last run in the other account are
+    left behind. A recurring task `dest` already has keeps every value it has, and only gets the
+    permission mode and worktree setting it lacks (absent or null). The mode's permissionModeCarried
+    comes with it from the same copy. Returns (tasks copied, tasks filled), or None when `dest`'s file
+    exists but cannot be read."""
     path = dest / "scheduled-tasks.json"
     data = load_json(path) if path.exists() else {}
     if not isinstance(data, dict) or not isinstance(data.get("scheduledTasks") or [], list):
         return None
     tasks = list(data.get("scheduledTasks") or [])
     have = {None, RESUME_TASK} | {t.get("id") for t in tasks if isinstance(t, dict)}
-    copied = 0
-    # Newest file first: when two accounts have the same task, the one used last wins.
+    # The recurring tasks `dest` had before this run; the ones this run copies in arrive whole.
+    own = {t["id"]: t for t in tasks
+           if isinstance(t, dict) and t.get("cronExpression") and t.get("id") not in (None, RESUME_TASK)}
+    copied, filled = 0, set()
+    # Newest file first: when two accounts have the same task, the one used last wins. A file's mtime
+    # moves with every run it records, so it only decides what fills a gap, never what replaces a value.
     for src in sorted(cards_root.glob("*/*/scheduled-tasks.json"), key=lambda p: (-p.stat().st_mtime, str(p))):
         if same_dir(src.parent, dest):
             continue
         other = load_json(src)
         for t in (other.get("scheduledTasks") if isinstance(other, dict) else None) or []:
-            if isinstance(t, dict) and t.get("cronExpression") and t.get("id") not in have:
+            if not (isinstance(t, dict) and t.get("cronExpression")):
+                continue
+            mine = own.get(t.get("id"))
+            if mine is not None:
+                if mine.get("permissionMode") is None and t.get("permissionMode") is not None:
+                    mine["permissionMode"] = t["permissionMode"]
+                    if mine.get("permissionModeCarried") is None and t.get("permissionModeCarried") is not None:
+                        mine["permissionModeCarried"] = t["permissionModeCarried"]
+                    filled.add(t["id"])
+                if mine.get("useWorktree") is None and t.get("useWorktree") is not None:
+                    mine["useWorktree"] = t["useWorktree"]
+                    filled.add(t["id"])
+            elif t.get("id") not in have:
                 tasks.append({k: v for k, v in t.items() if k not in TASK_RUN_FIELDS})
                 have.add(t["id"])
                 copied += 1
-    if copied and not dry_run:
+    if (copied or filled) and not dry_run:
         data["scheduledTasks"] = tasks
         write_json(path, data)  # 0600, like Claude Desktop's own copy
-    return copied
+    return copied, len(filled)
 
 
 def restart_remote_helpers(hosts, dry_run):
@@ -1687,7 +1705,11 @@ def cmd_desktop(args):
     if tasks is None:
         say(f"Could not read {dest / 'scheduled-tasks.json'}, so no scheduled tasks were copied.", "yellow")
     else:
-        say(f"{'Would copy' if args.dry_run else 'Copied'} {tasks} scheduled task(s) from other accounts.", "green")
+        copied_tasks, filled_tasks = tasks
+        say(f"{'Would copy' if args.dry_run else 'Copied'} {copied_tasks} scheduled task(s) from other accounts.", "green")
+        if filled_tasks:
+            say(f"{'Would fill' if args.dry_run else 'Filled'} missing fields in {filled_tasks} scheduled task(s) "
+                "from other accounts.", "green")
 
     if args.existing_cards_only:
         say("--existing-cards-only: CLI / VS Code sessions skipped.", "yellow")

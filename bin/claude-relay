@@ -1703,7 +1703,7 @@ def cmd_desktop(args):
 
     tasks = copy_scheduled_tasks(cards_root, dest, args.dry_run)
     if tasks is None:
-        say(f"Could not read {dest / 'scheduled-tasks.json'}, so no scheduled tasks were copied.", "yellow")
+        say(f"Could not read {dest / 'scheduled-tasks.json'}, so no scheduled tasks were copied or filled.", "yellow")
     else:
         copied_tasks, filled_tasks = tasks
         say(f"{'Would copy' if args.dry_run else 'Copied'} {copied_tasks} scheduled task(s) from other accounts.", "green")

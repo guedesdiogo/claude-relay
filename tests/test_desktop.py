@@ -389,7 +389,8 @@ class DesktopTests(unittest.TestCase):
         ])
         # The destination's old copies: "daily" has no mode and no worktree setting, "kept" has a mode.
         daily = {"id": "daily", "displayName": "Daily B", "cronExpression": "30 8 * * *", "enabled": False,
-                 "filePath": "/b/daily/SKILL.md", "cwd": "/Users/x/b", "lastRunAt": "2026-11-24T11:30:00.000Z"}
+                 "filePath": "/b/daily/SKILL.md", "cwd": "/Users/x/b", "permissionMode": None,
+                 "lastRunAt": "2026-11-24T11:30:00.000Z"}
         kept = {"id": "kept", "cronExpression": "0 9 * * *", "enabled": True, "filePath": "/b/kept/SKILL.md",
                 "permissionMode": "default", "useWorktree": None}
         once = {"id": "once", "fireAt": 1792000000000, "enabled": True}
